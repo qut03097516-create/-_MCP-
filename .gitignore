@@ -1,0 +1,27 @@
+# 密钥（README 安全规范：真实 .env 禁止入库）
+/.env
+/.env.*
+!/.env.example
+
+# 非运行时内容（README「已剔除」清单；必须锚定根目录，避免误伤 data/rag 等运行资产）
+/frontend/
+/rag/
+/console/
+/docs/
+/evaluation/
+/tests/
+/ai_sessions.json
+
+# 运行痕迹与缓存
+/logs/
+*.log
+__pycache__/
+*.py[cod]
+/.mimocode/
+/.playwright-cli/
+/.playwright/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+Thumbs.db

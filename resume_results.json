@@ -1,0 +1,388 @@
+{
+  "diagnose_risk": {
+    "success": true,
+    "data": {
+      "risks": [
+        {
+          "level": "info",
+          "type": "no_risk_found",
+          "desc": "未发现明显风险",
+          "action": "维持当前运行"
+        }
+      ],
+      "count": 1
+    },
+    "error_code": "E_OK",
+    "message": "成功",
+    "source": [
+      "check_data_quality",
+      "forecast_power"
+    ],
+    "elapsed_ms": 12618,
+    "trace_id": "f7d115c81f554224973485ebb9608e33",
+    "warning": null
+  },
+  "optimize_storage": {
+    "success": true,
+    "data": {
+      "battery_kwh": 1000,
+      "power_kw": 500,
+      "province": "四川",
+      "prices": {
+        "sharp": 1.2347,
+        "peak": 1.044,
+        "flat": 0.6864,
+        "valley": 0.3288,
+        "feed_in": 0.4
+      },
+      "has_price_evidence": true,
+      "strategy_head": [
+        {
+          "time": "05:30",
+          "price": 0.329,
+          "power_kw": 400.0,
+          "soc": 50.0
+        },
+        {
+          "time": "06:30",
+          "price": 0.329,
+          "power_kw": 40.0,
+          "soc": 86.0
+        },
+        {
+          "time": "07:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 89.6
+        },
+        {
+          "time": "08:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 89.6
+        },
+        {
+          "time": "09:30",
+          "price": 1.044,
+          "power_kw": 4.0,
+          "soc": 89.6
+        },
+        {
+          "time": "10:30",
+          "price": 1.235,
+          "power_kw": -500.0,
+          "soc": 90.0
+        },
+        {
+          "time": "11:30",
+          "price": 0.329,
+          "power_kw": 500.0,
+          "soc": 34.4
+        },
+        {
+          "time": "12:30",
+          "price": 0.686,
+          "power_kw": 105.96,
+          "soc": 79.4
+        },
+        {
+          "time": "13:30",
+          "price": 0.686,
+          "power_kw": 10.6,
+          "soc": 88.9
+        },
+        {
+          "time": "14:30",
+          "price": 0.686,
+          "power_kw": 1.06,
+          "soc": 89.9
+        },
+        {
+          "time": "15:30",
+          "price": 0.686,
+          "power_kw": 0.11,
+          "soc": 90.0
+        },
+        {
+          "time": "16:30",
+          "price": 0.329,
+          "power_kw": 0.01,
+          "soc": 90.0
+        },
+        {
+          "time": "17:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 90.0
+        },
+        {
+          "time": "18:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 90.0
+        },
+        {
+          "time": "19:30",
+          "price": 1.235,
+          "power_kw": -267.15,
+          "soc": 90.0
+        },
+        {
+          "time": "05:30",
+          "price": 0.329,
+          "power_kw": 296.83,
+          "soc": 60.3
+        },
+        {
+          "time": "06:30",
+          "price": 0.329,
+          "power_kw": 29.68,
+          "soc": 87.0
+        },
+        {
+          "time": "07:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 89.7
+        },
+        {
+          "time": "08:30",
+          "price": 1.044,
+          "power_kw": 0.0,
+          "soc": 89.7
+        },
+        {
+          "time": "09:30",
+          "price": 1.044,
+          "power_kw": 2.97,
+          "soc": 89.7
+        },
+        {
+          "time": "10:30",
+          "price": 1.235,
+          "power_kw": -500.0,
+          "soc": 90.0
+        },
+        {
+          "time": "11:30",
+          "price": 0.329,
+          "power_kw": 500.0,
+          "soc": 34.4
+        },
+        {
+          "time": "12:30",
+          "price": 0.686,
+          "power_kw": 105.85,
+          "soc": 79.4
+        },
+        {
+          "time": "13:30",
+          "price": 0.686,
+          "power_kw": 10.59,
+          "soc": 88.9
+        }
+      ],
+      "soc_tail": [
+        34.4,
+        79.4,
+        88.9,
+        89.9,
+        90.0,
+        90.0,
+        90.0,
+        90.0,
+        90.0,
+        60.3,
+        87.0,
+        89.7,
+        89.7,
+        89.7,
+        90.0,
+        34.4,
+        79.4,
+        88.9,
+        89.9,
+        90.0,
+        90.0,
+        90.0,
+        90.0,
+        90.0
+      ],
+      "net_revenue_est_yuan_per_day": 179.63,
+      "net_revenue_est_yuan": 1181.98,
+      "revenue_breakdown": {
+        "discharge": 482.13,
+        "avoid_curtailment": 1826.67,
+        "grid_cost": 788.75
+      },
+      "period_days": 6.58,
+      "uncertainty": "收益为估算值：未计储放损耗以外的运维成本与并网约束",
+      "time_value_minutes": 60
+    },
+    "error_code": "E_OK",
+    "message": "成功",
+    "source": [
+      "application.EnergyStorageOptimizer",
+      "price_database.json"
+    ],
+    "elapsed_ms": 12444,
+    "trace_id": "0aaefbe4ef4f463aa98e6012dbfa3492",
+    "warning": null
+  },
+  "search_knowledge": {
+    "success": true,
+    "data": {
+      "query": "光伏电站 风险诊断 低温 数据异常 储能 分时电价",
+      "count": 5,
+      "hits": [
+        {
+          "id": "2026-09-23_光伏电站参与电力市场交易-4-5983b891b87b",
+          "title": "光伏电站参与电力市场交易",
+          "path": "wiki/sources/2026-09-23_光伏电站参与电力市场交易.md",
+          "score": 0.6549,
+          "snippet": "## 相关概念 - [[行业动态与政策]]（电力市场政策演进是光伏行业收益模式变化的主要驱动来源） - [[2026-09-22_预测误差指标与MAPE局限]]（预测误差指标直接关系偏差考核成本，是交易申报策略的输入） - [[2026-09-22_光伏功率预测方法选型与数据预处理]]（功率预测方法选型决定申报电量的可信度与偏差风险） - [[光风储协同]]（多能互补可平滑出力波动，提高中长期与现货交易中的报价稳定性） --- *来源页",
+          "tags": [
+            "行业动态与政策"
+          ],
+          "citation_id": "[1]",
+          "source": "wiki/sources/2026-09-23_光伏电站参与电力市场交易.md",
+          "date": "2026-10-04",
+          "region": [],
+          "authority": [],
+          "topic": "电价与收益",
+          "evidence": [
+            "https://www.gov.cn/zhengce/zhengceku/202502/content_7002959.htm（国家发展改革委、国家能源局关于深化新能源上网电价市场化改革促进新能源高质量发展的通知",
+            "https://www.gov.cn/zhengce/zhengceku/202505/content_7022228.htm（关于印发《电力辅助服务市场基本规则》的通知",
+            "wiki/sources/2026-09-22_光伏功率预测方法选型与数据预处理.md",
+            "wiki/sources/2026-09-22_预测误差指标与MAPE局限.md"
+          ],
+          "semantic": 0.6808
+        },
+        {
+          "id": "2026-09-23_光伏组件隐裂诊断与处置-4-7fc171ac9eb9",
+          "title": "光伏组件隐裂诊断与处置",
+          "path": "wiki/sources/2026-09-23_光伏组件隐裂诊断与处置.md",
+          "score": 0.6253,
+          "snippet": "## 相关概念 - [[光伏组件]]（隐裂诊断的直接对象，缺陷最终体现为组件功率损失与安全风险） - [[2026-09-17_晶硅组件现场降解温湿度分析]]（现场降解与功率衰减实测分析，可与隐裂造成的衰减相互对照） - [[2026-09-17_短路电流温度系数辐照度依赖]]（短路电流随温度与辐照变化的规律，用于校核隐裂带来的电流损失） --- *来源页：编译自公开权威资料*",
+          "tags": [
+            "运维与故障诊断"
+          ],
+          "citation_id": "[2]",
+          "source": "wiki/sources/2026-09-23_光伏组件隐裂诊断与处置.md",
+          "date": "2026-10-04",
+          "region": [],
+          "authority": [],
+          "topic": "运维与故障诊断",
+          "evidence": [
+            "https://www.osti.gov/biblio/3422262（A",
+            "wiki/sources/2026-09-17_晶硅组件现场降解温湿度分析.md",
+            "wiki/sources/2026-09-17_短路电流温度系数辐照度依赖.md"
+          ],
+          "semantic": 0.5995
+        },
+        {
+          "id": "2026-09-23_光伏电站参与电力市场交易-1-e0a536897795",
+          "title": "光伏电站参与电力市场交易",
+          "path": "wiki/sources/2026-09-23_光伏电站参与电力市场交易.md",
+          "score": 0.6236,
+          "snippet": "# 光伏电站参与电力市场交易 **来源**：https://www.gov.cn/zhengce/zhengceku/202502/content_7002959.htm（国家发展改革委、国家能源局关于深化新能源上网电价市场化改革促进新能源高质量发展的通知） **关联来源**：https://www.gov.cn/zhengce/zhengceku/202505/content_7022228.htm（关于印发《电力辅助服务市场基本规则",
+          "tags": [
+            "行业动态与政策"
+          ],
+          "citation_id": "[3]",
+          "source": "wiki/sources/2026-09-23_光伏电站参与电力市场交易.md",
+          "date": "2026-10-04",
+          "region": [],
+          "authority": [
+            "国家发改委",
+            "国家能源局"
+          ],
+          "topic": "电价与收益",
+          "evidence": [
+            "https://www.gov.cn/zhengce/zhengceku/202502/content_7002959.htm（国家发展改革委、国家能源局关于深化新能源上网电价市场化改革促进新能源高质量发展的通知",
+            "https://www.gov.cn/zhengce/zhengceku/202505/content_7022228.htm（关于印发《电力辅助服务市场基本规则》的通知",
+            "wiki/sources/2026-09-22_光伏功率预测方法选型与数据预处理.md",
+            "wiki/sources/2026-09-22_预测误差指标与MAPE局限.md"
+          ],
+          "semantic": 0.6246
+        },
+        {
+          "id": "2026-09-23_电化学储能电站并网与安全防护国标-1-bb8430c2d8fa",
+          "title": "电化学储能电站并网与安全防护国标",
+          "path": "wiki/sources/2026-09-23_电化学储能电站并网与安全防护国标.md",
+          "score": 0.5548,
+          "snippet": "# 电化学储能电站并网与安全防护国标 **来源**：https://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=FBFCD7D664B248C1A7D6CC4BCB04C3D4（全国标准信息公共服务平台：GB/T 36547 电化学储能系统接入电网技术规定） **关联来源**：https://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=FC980FCD1",
+          "tags": [
+            "储能优化"
+          ],
+          "citation_id": "[4]",
+          "source": "wiki/sources/2026-09-23_电化学储能电站并网与安全防护国标.md",
+          "date": "2026-10-04",
+          "region": [
+            "全国"
+          ],
+          "authority": [],
+          "topic": "运维与故障诊断",
+          "evidence": [
+            "https://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=FBFCD7D664B248C1A7D6CC4BCB04C3D4（全国标准信息公共服务平台：GB/T",
+            "https://openstd.samr.gov.cn/bzgk/gb/newGbInfo?hcno=FC980FCD1DB8F9C5F27B93B294D87BE7（全国标准信息公共服务平台：GB/T",
+            "wiki/sources/2026-09-14_刚果铜矿233MW光储电站投运.md"
+          ],
+          "semantic": 0.5865
+        },
+        {
+          "id": "储能系统-1-4b5ef71c1a6b",
+          "title": "主题：储能系统",
+          "path": "wiki/topics/储能系统.md",
+          "score": 0.5404,
+          "snippet": "## 来源页 - [[2026-09-14_华为2026智能光伏十大趋势]] — 华为发布 2026 智能光伏十大趋势（含构网型储能、光风储协同等） - [[2026-09-14_西班牙Teruel937MW可再生能源储能拍卖]] — 西班牙 Teruel 937MW 可再生能源与储能并网拍卖 - [[2026-09-14_刚果铜矿233MW光储电站投运]] — CrossBoundary 在刚果（金）铜矿投运 233MW/526MWh",
+          "tags": [],
+          "citation_id": "[5]",
+          "source": "wiki/topics/储能系统.md",
+          "date": "2026-10-04",
+          "region": [
+            "西班牙",
+            "刚果（金）"
+          ],
+          "authority": [],
+          "topic": "行业动态与政策",
+          "evidence": [
+            "wiki/sources/2026-09-14_刚果铜矿233MW光储电站投运.md",
+            "wiki/sources/2026-09-14_华为2026智能光伏十大趋势.md",
+            "wiki/sources/2026-09-14_西班牙Teruel937MW可再生能源储能拍卖.md"
+          ],
+          "semantic": 0.5744
+        }
+      ]
+    },
+    "error_code": "E_OK",
+    "message": "成功",
+    "source": [
+      "rag_hybrid"
+    ],
+    "elapsed_ms": 2148,
+    "trace_id": "e55653864fe5437db362858b7b8b9c2f",
+    "warning": null
+  },
+  "generate_report": {
+    "success": true,
+    "data": {
+      "markdown": "# 光伏发电分析与协同优化报告\n\n> **trace_id**: `394082952789478ca92939a413604479`\n> **日期**: 2026-10-11 22:42\n> **模式**: future（未来 2 天）\n\n---\n\n## 一、执行摘要\n\n| 指标 | 数值 | 说明 |\n|:---:|:---:|:---|\n| 站点 | 四川 - Timeseries_30.542_101.948_E5_1kWp_crystSi_14_v47deg_2005_2023.csv | 数据集/用户站点 |\n| 坐标 | 30.542°N, 101.948°E | 经纬度 |\n| 装机容量 | 1.00 kWp | 额定容量 |\n| 数据质量 | **good** | 数据完整性评级 |\n| 估算日净收益 | **179.63 元/天** | 储能优化口径 |\n| 最高风险等级 | **low** | 共 1 项风险 |\n\n---\n\n## 二、关键数据\n\n### 2.1 数据质量\n\n| 项目 | 数值 |\n|:---|:---|\n| 数据范围 | 2005-01-01 ~ 2024-01-01 |\n| 记录数 | 166,536 条 |\n| 采样间隔 | 1.0 h |\n| 最大断档 | 1.0 h |\n| 缺失率 | POWER 0.0% |\n| 越界率 | 0.0% |\n| 质量评级 | **good** |\n\n### 2.2 发电量预测\n\n- 预测方式: dataset_iid\n- 预测点数: 105\n\n预测区间电量按采样点功率积分：\n\n$$E = \\sum_{i=1}^{N} P_i \\cdot \\Delta t$$\n\n| 变量 | 含义 | 取值/单位 |\n|:---|:---|:---|\n| $P_i$ | 第 $i$ 个采样点预测功率 | kW |\n| $\\Delta t$ | 采样间隔 | 1.0 h |\n| $N$ | 预测点数 | 105 |\n| $E$ | 预测区间积分电量 | **39,308.88 kWh** |\n\n---\n\n## 三、风险与建议\n\n| 等级 | 风险描述 | 处置建议 |\n|:---:|:---|:---|\n| **info** | 未发现明显风险 | 维持当前运行 |\n\n---\n\n## 四、储能与收益\n\n| 项目 | 数值 | 说明 |\n|:---|:---:|:---|\n| 储能容量 | 1,000 kWh | 配置参数 |\n| 储能功率 | 500 kW | 配置参数 |\n| 电价依据 | 四川 | 有省级证据 |\n| 估算日净收益 | **179.63 元/天** | 估算值 |\n| 6.58 天合计 | **1,181.98 元** | 估算值 |\n\n净收益构成：\n\n$$R_{net} = R_{dis} + R_{cur} - C_{grid}$$\n\n| 变量 | 含义 | 数值 |\n|:---|:---|:---:|\n| $R_{dis}$ | 放电收益 | 482.13 元 |\n| $R_{cur}$ | 避免弃光收益 | 1,826.67 元 |\n| $C_{grid}$ | 购电成本 | 788.75 元 |\n| $R_{net}$ | 净收益（周期合计） | **1,181.98 元** |\n\n---\n\n## 五、知识库引用（RAG）\n\n### 5.1 《光伏电站参与电力市场交易》\n\n- **来源**: wiki/sources/2026-09-23_光伏电站参与电力市场交易.md\n- **索引标记**: `[[光伏电站参与电力市场交易]]` [1]\n\n## 相关概念 - [[行业动态与政策]]（电力市场政策演进是光伏行业收益模式变化的主要驱动来源） - [[2026-09-22_预测误差指标与MAPE局限]]（预测误差指标直接关系偏差考核成本，是交易申报策略的输入） - [[2026-09-22_光伏功率预测方法选型与数据预处理]]（功率预测方法选型决定申报电量的可信度与偏差风险） - [[光风储协同]]（多能互补可平滑出力波动，提高中长期与现\n\n### 5.2 《光伏电站参与电力市场交易》\n\n- **来源**: wiki/sources/2026-09-23_光伏电站参与电力市场交易.md\n- **来源机构**: 国家发改委, 国家能源局\n- **索引标记**: `[[光伏电站参与电力市场交易]]` [2]\n\n# 光伏电站参与电力市场交易 **来源**：https://www.gov.cn/zhengce/zhengceku/202502/content_7002959.htm（国家发展改革委、国家能源局关于深化新能源上网电价市场化改革促进新能源高质量发展的通知） **关联来源**：https://www.gov.cn/zhengce/zhengceku/202505/content_7022228.h\n\n### 5.3 《主题：行业动态与政策》\n\n- **来源**: wiki/topics/行业动态与政策.md\n- **索引标记**: `[[主题：行业动态与政策]]` [3]\n\n## 简介 本主题跟踪光伏与储能行业的政策法规、市场数据与项目融资动态，覆盖欧盟（REPowerEU、NZIA）、中国（强制国标）、美洲（巴西装机、美国社区太阳能融资）等主要市场。\n\n### 5.4 《主题：储能系统》\n\n- **来源**: wiki/topics/储能系统.md\n- **索引标记**: `[[主题：储能系统]]` [4]\n\n## 来源页 - [[2026-09-14_华为2026智能光伏十大趋势]] — 华为发布 2026 智能光伏十大趋势（含构网型储能、光风储协同等） - [[2026-09-14_西班牙Teruel937MW可再生能源储能拍卖]] — 西班牙 Teruel 937MW 可再生能源与储能并网拍卖 - [[2026-09-14_刚果铜矿233MW光储电站投运]] — CrossBoundary 在刚果\n\n### 5.5 《LCOE 平准化度电成本（定义、公式与 25 年全生命周期成本构成）》\n\n- **来源**: wiki/sources/2026-09-22_LCOE平准化度电成本.md\n- **索引标记**: `[[LCOE 平准化度电成本（定义、公式与 25 年全生命周期成本构成）]]` [5]\n\n## 核心要点 - **计算公式**：LCOE = Σ(CAPEX + OPEX_t)/(1+r)^t ÷ Σ(E_t)/(1+r)^t，分子为折现后的总成本现值（初始投资、运维、保险、置换、财务费用），分母为折现后的累计上网电量；r 为折现率，t 为年份。 - **25 年全生命周期成本构成**：初始投资（组件、逆变器、支架、电缆、施工/EPC、并网与土地费用）；年度运维与保险；逆变器中期更换（\n\n---\n\n## 六、不确定性说明\n\n> 📌 **重要备注**\n>\n> - 本次运行未发现明显不确定性来源（部分降级项见对应章节）\n\n---\n\n## 七、下一步\n\n> 💡 **处理建议**\n>\n> - 如需精度提升：为电站训练混合残差模型（L 训练入口）。\n> - 如需储能决策：补充实际负荷曲线与并网约束后重跑收益估算。\n> - 报告中每个数字均有 trace_id 可回溯工具执行链（见文首）。\n",
+      "trace_id": "394082952789478ca92939a413604479",
+      "site_name": "四川 - Timeseries_30.542_101.948_E5_1kWp_crystSi_14_v47deg_2005_2023.csv",
+      "model_version": {
+        "forecast": "iid_transformer_lstm",
+        "storage": "EnergyStorageOptimizer",
+        "knowledge": "Knowledge/vault"
+      }
+    },
+    "error_code": "E_OK",
+    "message": "成功",
+    "source": [
+      "generate_report"
+    ],
+    "elapsed_ms": 37803,
+    "trace_id": "394082952789478ca92939a413604479",
+    "warning": null
+  }
+}

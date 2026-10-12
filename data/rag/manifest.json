@@ -1,0 +1,23 @@
+{
+  "version": "2026-10-04",
+  "generated_at": "2026-10-04T08:06:06Z",
+  "schema_version": "1.0.0",
+  "source_file": "rag_corpus_2026-10-04.jsonl",
+  "report_file": "rag_export_report_2026-10-04.md",
+  "total_chunks": 166,
+  "released_chunks": 161,
+  "quarantined_chunks": 5,
+  "topics": {
+    "光伏发电技术": 62,
+    "光伏综合": 1,
+    "功率预测与建模": 9,
+    "气象与辐照度": 25,
+    "电价与收益": 6,
+    "行业动态与政策": 18,
+    "运维与故障诊断": 40
+  },
+  "logical_corpus_hash": "7ffe37da107f652bc81da11db6f0037a3e92322a9608e94a1fae45cded948d9c",
+  "file_sha256": "d0a27a4e5b50d898a048fa7fa2c1de5d75376e05af36f172b4bedd39f9a024c5",
+  "quarantine_path": "quarantine.jsonl",
+  "release_path": "releases\\2026-10-04\\corpus.jsonl"
+}

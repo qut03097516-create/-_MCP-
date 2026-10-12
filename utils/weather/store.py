@@ -1,0 +1,209 @@
+"""
+气象数据本地缓存（DuckDB）
+==========================
+
+表 weather_hourly：按 0.01° 坐标网格共享缓存，与用户无关。
+所有时间为北京时间 tz-naive TIMESTAMP。
+
+提供：
+  init_weather_db / upsert / get_cached / covered_range
+  missing_day_segments / get_weather（编排：缺啥拉啥，增量更新）
+"""
+from __future__ import annotations
+
+import os
+import datetime as dt
+import threading
+from typing import List, Optional, Tuple
+
+import duckdb
+import pandas as pd
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+WEATHER_DB = os.path.join(_PROJECT_ROOT, 'data', 'weather.duckdb')
+
+GRID = 2  # 0.01° 网格
+
+# DuckDB 禁止同一进程内用不同 read_only 配置打开同一个库文件；
+# 预测主线程（读，read_only=True）与后台训练线程（写，read_only=False）
+# 并发访问 weather.duckdb 时会抛
+#   "Can't open a connection to same database file with a different configuration"
+# 导致 get_weather 直接失败、预测中止。用可重入锁把本模块的库访问串行化。
+_db_lock = threading.RLock()
+
+
+def _grid(v: float) -> float:
+    return round(float(v), GRID)
+
+
+def _connect(read_only: bool = False):
+    os.makedirs(os.path.dirname(WEATHER_DB), exist_ok=True)
+    return duckdb.connect(WEATHER_DB, read_only=read_only)
+
+
+def init_weather_db():
+    """幂等建表。"""
+    with _db_lock:
+        con = _connect()
+        try:
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS weather_hourly (
+                    lat_grid   DOUBLE,
+                    lon_grid   DOUBLE,
+                    ts         TIMESTAMP,
+                    ghi        DOUBLE,
+                    t2m        DOUBLE,
+                    ws2m       DOUBLE,
+                    source     VARCHAR DEFAULT 'nasa_power',
+                    updated_at TIMESTAMP,
+                    PRIMARY KEY (lat_grid, lon_grid, ts)
+                )
+            """)
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_weather_coord_ts "
+                "ON weather_hourly(lat_grid, lon_grid, ts)"
+            )
+        finally:
+            con.close()
+
+
+def upsert(df: pd.DataFrame, latitude: float, longitude: float,
+           source: str = 'nasa_power') -> int:
+    """写入/替换逐小时气象记录，返回写入行数。"""
+    if df is None or df.empty:
+        return 0
+    out = df.copy()
+    out['lat_grid'] = _grid(latitude)
+    out['lon_grid'] = _grid(longitude)
+    out['source'] = source
+    out['updated_at'] = pd.Timestamp.now()
+    out['ts'] = pd.to_datetime(out['ts'])
+
+    with _db_lock:
+        init_weather_db()
+        con = _connect()
+        try:
+            # 借助临时视图做 INSERT OR REPLACE
+            con.register('_w_in', out[['lat_grid', 'lon_grid', 'ts', 'ghi', 't2m',
+                                       'ws2m', 'source', 'updated_at']])
+            con.execute("""
+                INSERT OR REPLACE INTO weather_hourly
+                SELECT lat_grid, lon_grid, ts, ghi, t2m, ws2m, source, updated_at
+                FROM _w_in
+            """)
+            con.unregister('_w_in')
+        finally:
+            con.close()
+    return len(out)
+
+
+def get_cached(latitude: float, longitude: float, start, end) -> pd.DataFrame:
+    """读取区间内缓存，返回 [ts, ghi, t2m, ws2m]（按时间升序）。"""
+    lo = pd.Timestamp(str(start)[:10])
+    hi = pd.Timestamp(str(end)[:10]) + pd.Timedelta(days=1) - pd.Timedelta(hours=1)
+    with _db_lock:
+        init_weather_db()
+        con = _connect(read_only=True)
+        try:
+            tbl = con.execute("""
+                SELECT ts, ghi, t2m, ws2m FROM weather_hourly
+                WHERE lat_grid = ? AND lon_grid = ? AND ts BETWEEN ? AND ?
+                ORDER BY ts
+            """, [_grid(latitude), _grid(longitude), lo.to_pydatetime(),
+                  hi.to_pydatetime()]).fetchdf()
+        finally:
+            con.close()
+    if tbl.empty:
+        return pd.DataFrame(columns=['ts', 'ghi', 't2m', 'ws2m'])
+    tbl['ts'] = pd.to_datetime(tbl['ts'])
+    return tbl.reset_index(drop=True)
+
+
+def covered_range(latitude: float, longitude: float) -> Optional[Tuple[pd.Timestamp, pd.Timestamp, int]]:
+    """该网格已有缓存的 (最早, 最晚, 行数)。"""
+    with _db_lock:
+        init_weather_db()
+        con = _connect(read_only=True)
+        try:
+            row = con.execute("""
+                SELECT MIN(ts), MAX(ts), COUNT(*) FROM weather_hourly
+                WHERE lat_grid = ? AND lon_grid = ?
+            """, [_grid(latitude), _grid(longitude)]).fetchone()
+        finally:
+            con.close()
+    if not row or row[0] is None:
+        return None
+    return pd.Timestamp(row[0]), pd.Timestamp(row[1]), int(row[2])
+
+
+def missing_day_segments(latitude: float, longitude: float, start, end) -> List[Tuple[dt.date, dt.date]]:
+    """
+    按"天"检查覆盖，返回缺失的连续日期段（用于增量拉取）。
+    判定：某天有效记录 < 24 行即视为缺失（拉取后整段重写覆盖）。
+    """
+    lo = pd.Timestamp(str(start)[:10]).date()
+    hi = pd.Timestamp(str(end)[:10]).date()
+    if hi < lo:
+        return []
+
+    with _db_lock:
+        init_weather_db()
+        con = _connect(read_only=True)
+        try:
+            rows = con.execute("""
+                SELECT CAST(ts AS DATE) AS d, COUNT(*) AS n FROM weather_hourly
+                WHERE lat_grid = ? AND lon_grid = ?
+                  AND ts >= ? AND ts < ?
+                GROUP BY d
+            """, [_grid(latitude), _grid(longitude),
+                  pd.Timestamp(lo).to_pydatetime(),
+                  (pd.Timestamp(hi) + pd.Timedelta(days=1)).to_pydatetime()]).fetchall()
+        finally:
+            con.close()
+
+    full_days = {r[0] for r in rows if int(r[1]) >= 24}
+    missing = [lo + dt.timedelta(days=i)
+               for i in range((hi - lo).days + 1)
+               if (lo + dt.timedelta(days=i)) not in full_days]
+
+    # 合并连续日期
+    segments: List[Tuple[dt.date, dt.date]] = []
+    for d in missing:
+        if segments and d == segments[-1][1] + dt.timedelta(days=1):
+            segments[-1] = (segments[-1][0], d)
+        else:
+            segments.append((d, d))
+    return segments
+
+
+def get_weather(latitude: float, longitude: float, start, end,
+                *, force_refresh: bool = False):
+    """
+    编排入口：返回 (df, meta)。
+    - 先读 DuckDB 缓存；仅对缺失日期段调用 NASA POWER；增量写回。
+    - force_refresh=True 时整段重新拉取。
+    - meta: {cached_rows, fetched_rows, segments, fully_cached}
+    """
+    from utils.weather.nasa_power import fetch_nasa_power
+
+    lo = pd.Timestamp(str(start)[:10]).date()
+    hi = pd.Timestamp(str(end)[:10]).date()
+
+    if force_refresh:
+        segments = [(lo, hi)]
+    else:
+        segments = missing_day_segments(latitude, longitude, lo, hi)
+
+    fetched = 0
+    for seg_s, seg_e in segments:
+        new_df = fetch_nasa_power(latitude, longitude, seg_s, seg_e)
+        fetched += upsert(new_df, latitude, longitude)
+
+    df = get_cached(latitude, longitude, lo, hi)
+    return df, {
+        'cached_rows': len(df),
+        'fetched_rows': fetched,
+        'fetched_segments': [[s.isoformat(), e.isoformat()] for s, e in segments],
+        'fully_cached': fetched == 0,
+        'source': 'nasa_power',
+    }

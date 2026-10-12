@@ -1,0 +1,226 @@
+{
+  "schema": "pv-station-pollution-detect-config",
+  "version": "1.1",
+  "description": "光伏电站逐小时时序数据 9 类污染检测的阈值与响应规则配置清单，与 pv-station-analysis skill 的 scripts/pollution_detect.py 配套使用（基线来自 30.542/101.948 站点 2005-2023 数据集验证结果）；v1.1 修正 v1.1.0 缺陷：attenuation 按月分位动态基线、drift 季节豁免（11-2 月高效不告警）、time_shift min_days 3→5、判定三态化（POLLUTED / SUSPECTED / CLEAN）",
+  "data_format": {
+    "source": "PVGIS-ERA5 逐小时 CSV（含 time, P, Gb(i), Gd(i), Gr(i), H_sun, T2m, WS10m, Int 列）",
+    "nominal_system_kwp": 1.0,
+    "nominal_power_w_hard_cap": 2500,
+    "note": "所有阈值均可按站点实际配置覆盖；标称功率影响 spike 阈值与满量程判断"
+  },
+  "detectors": [
+    {
+      "id": "dropout",
+      "name": "缺失块",
+      "category": "数据缺失 / 时间不连续",
+      "enabled": true,
+      "severity": "high",
+      "thresholds": {
+        "min_gap_hours": 1.0
+      },
+      "trigger_rule": "相邻两行时间间隔 > min_gap_hours 小时即构成缺失块；将连续缺失合并为缺口并按块报告",
+      "response": {
+        "alert": "检出时间缺口（块数 x / 总缺口 y 小时），MCP 质检只查空值不查时间连续性，缺口可能被漏报",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "缺口涉及的统计窗口（日/月发电量与收益）应剔除或标注缺失占比后重算，缺口期间不做预测与效率计算",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "reconstructed",
+      "name": "重建 / 插值标记",
+      "category": "数据来源标记",
+      "enabled": true,
+      "severity": "medium",
+      "thresholds": {},
+      "trigger_rule": "数据源插值/重建标记列 Int != 0 的行即视为重建数据",
+      "response": {
+        "alert": "检出重建行（x 行，Int!=0），重建值可能偏离真实量测",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "重建行从统计与拟合中剔除，或单独标注为低置信数据；与 stuck 卡死段联动检查（Int=1 常伴随重建）",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "spike",
+      "name": "尖峰",
+      "category": "越界 / 物理不可信",
+      "enabled": true,
+      "severity": "high",
+      "thresholds": {
+        "nominal_power_kwp": 1.0,
+        "spike_ratio": 1.0,
+        "hard_cap_w": 2500.0
+      },
+      "trigger_rule": "P > 标称功率(W) x spike_ratio（默认 1kWp x 1.0 = 1000W）即为越界；P 达到满量程硬上限（2500W）必为物理不可能",
+      "response": {
+        "alert": "检出尖峰 x 行（含满量程硬顶 y 次），MCP 越界阈值未含 P 物理上限时此处会漏检",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "超过物理上限的行剔除或截断；满量程 2500W 行重点复核量纲与传感器饱和，不参与平均效率计算",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "stuck",
+      "name": "卡死段",
+      "category": "传感器 / 采集冻结",
+      "enabled": true,
+      "severity": "high",
+      "thresholds": {
+        "min_hours": 6,
+        "day_start_hour": 7,
+        "day_end_hour": 18,
+        "min_value_w": 1.0
+      },
+      "trigger_rule": "白天时段（7-18 时）P 连续 >= min_hours 小时保持同一恒定值（>1W），且期间辐照有明显变化（辐照范围 > 0）即判定卡死",
+      "response": {
+        "alert": "检出卡死段（x 段 / y 行），恒定值不代表真实出力，均值类统计被系统性拉偏",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "卡死段整段剔除后重算发电量、效率与收益；检查采集链路（数据采集器死机、通信冻结）",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "night_phantom_power",
+      "name": "夜间假功率",
+      "category": "量测底噪 / 器件漏电",
+      "enabled": true,
+      "severity": "high",
+      "thresholds": {
+        "g_threshold_wm2": 0.05,
+        "p_threshold_w": 5.0
+      },
+      "trigger_rule": "夜间总辐照 <= 0.05 W/m2 而 P 仍 > 5W 的行（夜间 G=0 时 P 应恒为 0）",
+      "response": {
+        "alert": "检出夜间假功率 x 行（最大 y W），夜间 P 残留会虚增发电量统计",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "夜间（辐照为 0）的 P 统一归零后再累计发电量；排查传感器底噪或逆变器夜间自耗",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "attenuation",
+      "name": "衰减段",
+      "category": "效率异常偏低",
+      "enabled": true,
+      "severity": "medium",
+      "thresholds": {
+        "eff_quantile": 0.02,
+        "min_hours": 3,
+        "window_hours": [
+          11,
+          12,
+          13,
+          14
+        ],
+        "min_g_wm2": 600.0,
+        "min_p_w": 100.0,
+        "max_g_wm2": 1400.0,
+        "cli_enable_flag": "--attenuation-quantile 传 0 关闭该项",
+        "quantile_scope": "per_month"
+      },
+      "trigger_rule": "仅在中午高辐照窗口（11-14 时、G>600 且 P>100 且 G<1400）考察效率 P/G，效率低于**同月份**全局 2% 分位动态阈值（按月计算：冬季整月高效时基线随当月分布抬高，不再用全年阈值误判季节性差异）且连续 >= 3 小时构成衰减段；低辐照（云遮挡）行不打断段",
+      "response": {
+        "alert": "检出衰减段（x 段 / y 行），效率显著低于全局基线，需区分设备老化与数据异常",
+        "data_quality_verdict": "suspected - 疑似污染，需人工研判（软性项，不直接判 poor）"
+      },
+      "clean_suggestion": "核对衰减段对应时段是否清洗、遮挡或设备故障；确属数据异常则剔除后重估效率，确属老化则提示运维整改",
+      "verdict_class": "soft"
+    },
+    {
+      "id": "noise",
+      "name": "噪声",
+      "category": "随机波动过大",
+      "enabled": true,
+      "severity": "medium",
+      "thresholds": {
+        "day_min_g_wm2": 50.0,
+        "day_min_p_w": 10.0,
+        "resid_std_threshold_w": 40.0
+      },
+      "trigger_rule": "白天（G>50 且 P>10）逐行做 P-G 线性拟合，残差 std 超过 40W 判定噪声异常；正常站点残差 std 通常 < 40W（基线站点实测 80.2W 已超限）",
+      "response": {
+        "alert": "P-G 拟合残差 std = x W（阈值 y W），噪声过大，逐点可信度低",
+        "data_quality_verdict": "poor - 需清洗"
+      },
+      "clean_suggestion": "对噪声行平滑或剔除离群点；排查采样抖动、传感器老化、通信干扰；噪声污染主要影响短期功率曲线而非长周期电量",
+      "verdict_class": "hard"
+    },
+    {
+      "id": "drift",
+      "name": "月效率漂移",
+      "category": "长期偏移",
+      "enabled": true,
+      "severity": "medium",
+      "thresholds": {
+        "dev_ratio": 0.025,
+        "min_months": 2,
+        "min_g_wm2": 200.0,
+        "min_p_w": 30.0,
+        "seasonal_exclude_months": [
+          11,
+          12,
+          1,
+          2
+        ],
+        "seasonal_exclude_direction": "high_only"
+      },
+      "trigger_rule": "按月聚合效率（仅取 G>200 且 P>30 的行），月效率偏离全期中位数超过 +/-2.5% 且连续 >= 2 个月构成漂移段；季节判别：11-2 月效率高于基线属冬季晴天的季节性高效，豁免且不计入漂移段（同时打断连续段），负向偏离任何月份仍然告警",
+      "response": {
+        "alert": "检出月效率漂移 x 段，长周期统计（年发电量、衰减率）被系统性偏移",
+        "data_quality_verdict": "suspected - 疑似污染，需人工研判（软性项，不直接判 poor）"
+      },
+      "clean_suggestion": "校正漂移时段基数或剔除后评估衰减；联动核对清洗周期、组件老化与遮挡变化记录",
+      "verdict_class": "soft"
+    },
+    {
+      "id": "time_shift",
+      "name": "时间平移",
+      "category": "时间戳错位",
+      "enabled": true,
+      "severity": "medium",
+      "thresholds": {
+        "min_shift_hours": 4,
+        "min_p_peak_w": 500.0,
+        "min_days": 5
+      },
+      "trigger_rule": "逐日比较 P 峰值小时与辐照峰值小时，同向偏差 >= 4 小时且连续持续 >= 5 天方判定为时间平移；单日/短期峰值错位属天气波动不计（min_days 由 3 提至 5，修复对孤立 3 天事件的过度告警）",
+      "response": {
+        "alert": "检出时间平移 x 段 / y 天（pv-g 峰值错位 >= 4h 持续多日）",
+        "data_quality_verdict": "suspected - 疑似污染，需人工研判（软性项，不直接判 poor）"
+      },
+      "clean_suggestion": "核对数据时间戳与辐照时间戳是否对齐（时区/冬夏令时/导出偏移），对齐后重跑；本基线站点量级小未单独检出",
+      "verdict_class": "soft"
+    }
+  ],
+  "response_policy": {
+    "verdict_rule": "三态判定：硬性六类（dropout、reconstructed、spike、stuck、night_phantom_power、noise）任一检出 → POLLUTED（需清洗）；仅软性三类（attenuation、drift、time_shift）检出 → SUSPECTED（疑似，需人工研判），不得直接判 POLLUTED；全部未检出 → CLEAN",
+    "data_quality_mapping": {
+      "POLLUTED": "poor - 需清洗",
+      "SUSPECTED": "suspected - 疑似污染（需人工研判，不直接判 poor）",
+      "CLEAN": "good"
+    },
+    "risk_integration": "检出 POLLUTED 时，风险诊断必须附加数据质量告警，不得沿用 MCP 的 good 结论；检出 SUSPECTED 时，报告须单独归类为「疑似（需人工研判）」并提示人工复核，不得按 POLLUTED 处理",
+    "impact_reporting": "发电量、储能收益等衍生估算须说明污染占比（检出行数 / 总行数）与量级影响（本基线污染约 3.4%，对电量影响 <1% 量级）",
+    "dominant_type": "主导污损类型按检出量与物理可信度综合判断（基线中 night_phantom_power 600 行 > spike 217 行 > dropout 98h）",
+    "injected_data_check": "用户数据为实验注入时，逐类对照注入行数与检出行数，给出吻合 / 部分吻合 / 未检出结论",
+    "confidence_rule": "单一非权威数字标为待确认，不以相似来源重复佐证"
+  },
+  "baseline_verification": {
+    "dataset": "Timeseries_30.542_101.948_E5_1kWp_crystSi_14_v47deg_2005_2023_BeijingTime(1).csv",
+    "rows": 166441,
+    "results": {
+      "dropout": "3 块 / 98 h",
+      "reconstructed": "18 行 (Int!=0)",
+      "spike": "217 行 (阈值 1000W, 最大 2500W, 满量程 2500W 71 次)",
+      "stuck": "2 段 / 20 行",
+      "night_phantom_power": "600 行 (最大 79.97W)",
+      "attenuation": "42 段 / 144 行 (按月阈值 0.7469~0.7805)",
+      "noise": "残差 std 80.2W (阈值 40W, 异常, 异常月 68 个)",
+      "drift": "4 段 (月效率中位数 0.8159, 冬季高效豁免 30 月)",
+      "time_shift": "0 天 (min_days=5, 量级小未单独检出)",
+      "verdict": "POLLUTED - 需清洗 (硬性六类命中; 软性 attenuation/drift 为伴随项)"
+    },
+    "retest_note": "v1.1 缺陷修复后于 2026-10-12 复测：硬性六类与 noise 基线保持不变（dropout 3块/98h、reconstructed 18、spike 217含71×2500W、stuck 2段/20行、night_phantom 600、noise 80.2W）；attenuation/drift 按新规则重计。云南干净数据集对照：硬性全 0、noise 14.6W 正常、drift 12段→0段（冬季豁免35月）、time_shift 3天→0，仅 attenuation 软性命中 → 判定 SUSPECTED（不再误判 POLLUTED）"
+  }
+}

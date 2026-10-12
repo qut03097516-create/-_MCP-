@@ -1,0 +1,23 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+PyJWT==2.8.0
+pydantic==2.6.1
+pandas
+numpy
+plotly
+scikit-learn
+torch
+geopandas
+shapely
+duckdb
+pvlib>=0.10.0
+openpyxl
+requests
+# 测试依赖：starlette 0.36 的 TestClient 要求 httpx<0.28（0.28 移除了 Client(app=...) 参数）
+httpx==0.27.2
+pytest>=8
+# 阶段三 RAG 混合检索（M3.3/M3.2）：BM25 分词 + 向量 embedding
+jieba
+rank_bm25
+fastembed
+onnxruntime

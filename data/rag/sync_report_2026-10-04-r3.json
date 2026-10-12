@@ -1,0 +1,33 @@
+{
+  "action": "sync",
+  "synced_at": "2026-10-04T08:04:00Z",
+  "version": "2026-10-04-r3",
+  "previous_version": "2026-10-04-r2",
+  "source_file": "D:\\Demo\\Script\\data\\rag\\releases\\2026-10-04-r2\\corpus.jsonl",
+  "chunk_count": 123,
+  "diff": {
+    "added": 0,
+    "changed": 0,
+    "unchanged": 123,
+    "removed": 0
+  },
+  "removed_from_repo": [
+    "2026-10-04-2e493f40",
+    "2026-10-04"
+  ],
+  "topics": {
+    "光伏发电技术": 50,
+    "气象与辐照度": 25,
+    "运维与故障诊断": 20,
+    "行业动态与政策": 18,
+    "功率预测与建模": 9,
+    "光伏综合": 1
+  },
+  "embedding": {
+    "model": "BAAI/bge-small-zh-v1.5",
+    "dim": 512,
+    "normalization": "l2"
+  },
+  "build_seconds": 0.03,
+  "keep_versions": 2
+}

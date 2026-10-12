@@ -1,0 +1,31 @@
+{
+  "version": "2026-10-04-r3",
+  "logical_corpus_hash": "2e493f406ab6bc00b7cc7aef46b1d54decdaeabd21b576b53f84490b0f4230ac",
+  "file_sha256": "d2768215529f40b00cac61661d036a5a704f90113dd43f98ef801f6e478f3bdc",
+  "chunk_count": 123,
+  "embedding": {
+    "model": "BAAI/bge-small-zh-v1.5",
+    "dim": 512,
+    "normalization": "l2"
+  },
+  "published_at": "2026-10-04T08:04:00Z",
+  "source_file": "D:\\Demo\\Script\\data\\rag\\releases\\2026-10-04-r2\\corpus.jsonl",
+  "diff": {
+    "added": 0,
+    "changed": 0,
+    "unchanged": 123,
+    "removed": 0
+  },
+  "topics": {
+    "光伏发电技术": 50,
+    "气象与辐照度": 25,
+    "运维与故障诊断": 20,
+    "行业动态与政策": 18,
+    "功率预测与建模": 9,
+    "光伏综合": 1
+  },
+  "build": {
+    "embedding_seconds": 0.03,
+    "force": false
+  }
+}

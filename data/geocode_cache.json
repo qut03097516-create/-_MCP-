@@ -1,0 +1,38 @@
+{
+ "40.46,116.49": {
+  "country": "中华人民共和国",
+  "province": "北京市",
+  "city": "北京市",
+  "district": "怀柔区",
+  "display": "中华人民共和国 · 北京市 · 怀柔区",
+  "latitude": 40.457,
+  "longitude": 116.494
+ },
+ "25.43,102.11": {
+  "country": "中华人民共和国",
+  "province": "云南省",
+  "city": "楚雄彝族自治州",
+  "district": "武定縣",
+  "display": "中华人民共和国 · 云南省 · 楚雄彝族自治州 · 武定縣",
+  "latitude": 25.429,
+  "longitude": 102.107
+ },
+ "30.0,135.0": {
+  "country": "",
+  "province": "",
+  "city": "",
+  "district": "",
+  "display": "该位置无行政区划信息（可能位于海洋或无人区）",
+  "latitude": 30.0,
+  "longitude": 135.0
+ },
+ "31.23,121.47": {
+  "country": "中华人民共和国",
+  "province": "上海市",
+  "city": "上海市",
+  "district": "黃浦區",
+  "display": "中华人民共和国 · 上海市 · 黃浦區",
+  "latitude": 31.23,
+  "longitude": 121.474
+ }
+}

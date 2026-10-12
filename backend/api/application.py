@@ -1,0 +1,954 @@
+from fastapi import APIRouter, Query, HTTPException, Cookie, Header
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import sys
+import os
+import json
+import re
+import hashlib
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+
+def convert_numpy_types(obj):
+    """递归转换numpy类型为原生Python类型"""
+    import math
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        f = float(obj)
+        return 0.0 if math.isnan(f) or math.isinf(f) else f
+    elif isinstance(obj, float):
+        return 0.0 if math.isnan(obj) or math.isinf(obj) else obj
+    elif isinstance(obj, np.ndarray):
+        return convert_numpy_types(obj.tolist())
+    elif isinstance(obj, pd.Timestamp):
+        return str(obj)
+    elif isinstance(obj, pd.Series):
+        return convert_numpy_types(obj.tolist())
+    else:
+        return obj
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from utils.data_loader import load_pv_data, get_geo_finder
+from utils.predictor import predict_pv
+
+router = APIRouter()
+
+class ScenarioAnalysisRequest(BaseModel):
+    pv_file: Optional[str] = None
+    site_id: Optional[int] = None      # 用户电站（优先用已上传发电数据）
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    battery_capacity: Optional[int] = 1000
+    battery_power: Optional[int] = 500
+    battery_efficiency: Optional[int] = 90
+    initial_soc: Optional[int] = 50
+    power_percent: Optional[int] = 50
+    load_ratio: Optional[float] = 0.3
+    load_type: Optional[str] = 'fixed'
+    # 自定义电价（元/kWh）；不传则回落省份库/默认
+    prices: Optional[Dict[str, float]] = None
+
+def extract_coordinates(filename: str):
+    """从文件名中提取经纬度信息"""
+    pattern = r'Timeseries_(\d+\.\d+)_(\d+\.\d+)_'
+    match = re.search(pattern, filename)
+    if match:
+        lat = float(match.group(1))
+        lon = float(match.group(2))
+        return lat, lon
+    return None, None
+
+def get_province_by_coordinates(lat: float, lon: float):
+    """根据经纬度获取省份"""
+    geo_finder = get_geo_finder()
+    return geo_finder.get_province(lon, lat)
+
+def get_province_prices(province: str):
+    """从 JSON 文件中获取省份的电价信息"""
+    if province == "台湾":
+        return {
+            'sharp': 1.0,
+            'peak': 0.8,
+            'flat': 0.6,
+            'valley': 0.3,
+            'feed_in': 0.4
+        }
+
+    json_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'price_database.json')
+
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        if province in data['provinces']:
+            prices = data['provinces'][province]['prices']
+            return {
+                'sharp': prices['sharp'],
+                'peak': prices['peak'],
+                'flat': prices['flat'],
+                'valley': prices['valley'],
+                'feed_in': 0.4
+            }
+        return None
+    except (FileNotFoundError, KeyError, json.JSONDecodeError):
+        return None
+
+def generate_typical_load_profile(hours, load_type='industrial', max_load=1.0):
+    """生成典型日负荷曲线"""
+    if isinstance(hours, int):
+        hours = np.arange(hours)
+
+    load = np.zeros(len(hours))
+
+    if load_type == 'industrial':
+        for i, h in enumerate(hours % 24):
+            if 6 <= h < 22:
+                load[i] = max_load * (0.7 + 0.3 * np.sin((h - 14) * np.pi / 8))
+            else:
+                load[i] = max_load * 0.2
+    elif load_type == 'commercial':
+        for i, h in enumerate(hours % 24):
+            if 9 <= h < 18:
+                load[i] = max_load * 0.9
+            elif 18 <= h < 22:
+                load[i] = max_load * 0.6
+            else:
+                load[i] = max_load * 0.15
+    elif load_type == 'residential':
+        for i, h in enumerate(hours % 24):
+            if 7 <= h < 9 or 18 <= h < 21:
+                load[i] = max_load * 0.8
+            elif 12 <= h < 14:
+                load[i] = max_load * 0.5
+            elif 0 <= h < 6:
+                load[i] = max_load * 0.2
+            else:
+                load[i] = max_load * 0.4
+
+    return load
+
+class EnergyStorageOptimizer:
+    def __init__(self, capacity, power, initial_soc=50, efficiency=0.9, load_ratio=0.3, soc_min=10, soc_max=90, load_profile=None):
+        self.capacity = capacity
+        self.power = power
+        self.initial_soc = initial_soc
+        self.efficiency = efficiency / 100
+        self.load_ratio = load_ratio
+        self.soc_min = soc_min
+        self.soc_max = soc_max
+        self.load_profile = load_profile
+        self.soc_curve = []
+        self.strategy = None
+        self.revenue = 0
+
+    def optimize(self, power_pred, time_prices, time_step_minutes=10):
+        """生成充放电策略"""
+        dt_hour = time_step_minutes / 60
+
+        if len(power_pred) != len(time_prices):
+            raise ValueError("预测功率曲线与分时电价长度不一致")
+
+        unique_prices = sorted(set(time_prices), reverse=True)
+
+        if len(unique_prices) >= 4:
+            sharp_price = unique_prices[0]
+            peak_price = unique_prices[1]
+            flat_price = unique_prices[2]
+            valley_price = unique_prices[3]
+        elif len(unique_prices) == 3:
+            peak_price = unique_prices[0]
+            flat_price = unique_prices[1]
+            valley_price = unique_prices[2]
+            sharp_price = peak_price
+        elif len(unique_prices) == 2:
+            peak_price = unique_prices[0]
+            valley_price = unique_prices[1]
+            flat_price = (peak_price + valley_price) / 2
+            sharp_price = peak_price
+        else:
+            peak_price = unique_prices[0] if unique_prices else 0.6
+            valley_price = peak_price
+            flat_price = peak_price
+            sharp_price = peak_price
+
+        expected_peak_price = peak_price
+        rated_power = power_pred['POWER_pred'].max()
+
+        if self.load_profile is not None and len(self.load_profile) == len(power_pred):
+            load_arr = rated_power * np.asarray(self.load_profile, dtype=float)
+        else:
+            load_arr = np.full(len(power_pred), rated_power * self.load_ratio)
+        net_power = power_pred['POWER_pred'].values - load_arr
+
+        df = pd.DataFrame({
+            'time': power_pred['DATATIME'],
+            'net_power': net_power,
+            'price': time_prices,
+            'pv_power': power_pred['POWER_pred'],
+            'load': load_arr
+        })
+
+        pv_power_arr = df['pv_power'].values
+        net_p_arr = df['net_power'].values
+        price_arr = df['price'].values
+
+        current_soc = self.initial_soc
+        self.soc_curve = [current_soc]
+        charge_discharge = []
+        exports = []
+
+        for i in range(len(df)):
+            pv_power = pv_power_arr[i]
+            net_p = net_p_arr[i]
+            price = price_arr[i]
+
+            max_charge = min(
+                self.power,
+                (self.soc_max - current_soc) / 100 * self.capacity / dt_hour
+            )
+            max_discharge = min(
+                self.power,
+                (current_soc - self.soc_min) / 100 * self.capacity / dt_hour
+            )
+
+            if price >= sharp_price:
+                if max_discharge > 0:
+                    discharge = min(max_discharge, abs(net_p) if net_p < 0 else self.power)
+                    if discharge > 0:
+                        theoretical_soc = current_soc - discharge / self.efficiency / self.capacity * 100
+                        if theoretical_soc < self.soc_min:
+                            max_possible_discharge = (current_soc - self.soc_min) * self.capacity / 100 * self.efficiency
+                            discharge = min(discharge, max_possible_discharge)
+                            current_soc = self.soc_min
+                        else:
+                            current_soc = theoretical_soc
+                        charge_discharge.append(-discharge)
+                    else:
+                        charge_discharge.append(0)
+                else:
+                    charge_discharge.append(0)
+            elif price <= valley_price:
+                if max_charge > 0:
+                    if net_p > 0:
+                        charge = min(max_charge, net_p)
+                        theoretical_soc = current_soc + charge * self.efficiency / self.capacity * 100
+                        if theoretical_soc > self.soc_max:
+                            max_possible_charge = (self.soc_max - current_soc) * self.capacity / 100 / self.efficiency
+                            charge = min(charge, max_possible_charge)
+                            current_soc = self.soc_max
+                        else:
+                            current_soc = theoretical_soc
+                        charge_discharge.append(charge)
+                    else:
+                        if price * (1 / self.efficiency) < expected_peak_price:
+                            charge = min(max_charge, self.power)
+                            theoretical_soc = current_soc + charge * self.efficiency / self.capacity * 100
+                            if theoretical_soc > self.soc_max:
+                                max_possible_charge = (self.soc_max - current_soc) * self.capacity / 100 / self.efficiency
+                                charge = min(charge, max_possible_charge)
+                                current_soc = self.soc_max
+                            else:
+                                current_soc = theoretical_soc
+                            charge_discharge.append(charge)
+                        else:
+                            charge_discharge.append(0)
+                else:
+                    charge_discharge.append(0)
+            else:
+                if net_p > 0 and max_charge > 0:
+                    charge = min(max_charge, net_p)
+                    theoretical_soc = current_soc + charge * self.efficiency / self.capacity * 100
+                    if theoretical_soc > self.soc_max:
+                        max_possible_charge = (self.soc_max - current_soc) * self.capacity / 100 / self.efficiency
+                        charge = min(charge, max_possible_charge)
+                        current_soc = self.soc_max
+                    else:
+                        current_soc = theoretical_soc
+                    charge_discharge.append(charge)
+                else:
+                    charge_discharge.append(0)
+            self.soc_curve.append(current_soc)
+            # 上网电量 = 光伏自用后剩余未充入部分 + 放电超过负载缺额的部分
+            act = charge_discharge[-1] if charge_discharge else 0.0
+            charge_now = max(act, 0.0)
+            discharge_now = max(-act, 0.0)
+            load_now = load_arr[i]
+            pv_to_load = min(pv_power, load_now)
+            pv_surplus = pv_power - pv_to_load
+            deficit = load_now - pv_to_load
+            charge_from_pv = min(charge_now, pv_surplus)
+            exports.append((pv_surplus - charge_from_pv) + max(discharge_now - deficit, 0.0))
+
+        self.strategy = pd.DataFrame({
+            'DATATIME': power_pred['DATATIME'],
+            'PV_Power': power_pred['POWER_pred'],
+            'Load': load_arr,
+            'Price': time_prices,
+            'Charge_Discharge': charge_discharge,
+            'Export': exports,
+            'SOC': self.soc_curve[:-1]
+        })
+
+        return self.strategy
+
+    def calculate_revenue(self, feed_in_tariff=0.4, time_step_minutes=10):
+        """基线差分结算：与“光伏优先自用、余电上网、缺额购电”基线相比的净节省。
+
+        四项拆分保持恒等：net = discharge_revenue + avoid_curtailment - grid_cost + feed_in_revenue
+        - 放电自用部分按零售价结算，拆分为电网来源（购电套利）与光伏来源（弃光消纳）
+        - 电网充电按零售价计入成本；光伏充电按上网电价计入机会成本
+        - 上网结算只计净变化（放电上网 - 光伏充电占用的上网电量）
+        """
+        if self.strategy is None:
+            raise ValueError("请先运行optimize方法生成策略")
+
+        df = self.strategy
+        dt_hour = time_step_minutes / 60
+        feed_in_tariff = float(feed_in_tariff)
+
+        if 'Load' not in df.columns:
+            raise ValueError('策略数据缺少 Load 列，请重新生成策略')
+
+        charge = df['Charge_Discharge'].clip(lower=0).to_numpy(dtype=float)
+        discharge = (-df['Charge_Discharge'].clip(upper=0)).to_numpy(dtype=float)
+        pv = df['PV_Power'].to_numpy(dtype=float)
+        load = df['Load'].to_numpy(dtype=float)
+        price = df['Price'].to_numpy(dtype=float)
+
+        # 能量流分解
+        pv_to_load = np.minimum(pv, load)
+        deficit = load - pv_to_load
+        pv_surplus = pv - pv_to_load
+        charge_from_pv = np.minimum(charge, pv_surplus)
+        grid_charge = charge - charge_from_pv
+        discharge_to_load = np.minimum(discharge, deficit)
+        discharge_to_grid = discharge - discharge_to_load
+
+        # 双电量池：按充电来源跟踪电池内能量，放电时按池占比拆分来源
+        # 初始电量视为电网来源（历史上购入）
+        grid_pool = self.initial_soc / 100 * self.capacity
+        pv_pool = 0.0
+        grid_share = np.zeros(len(df))
+        for i in range(len(df)):
+            grid_pool += grid_charge[i] * self.efficiency
+            pv_pool += charge_from_pv[i] * self.efficiency
+            total = grid_pool + pv_pool
+            if discharge[i] > 0 and total > 0:
+                f = grid_pool / total
+                grid_share[i] = f
+                removed = discharge[i] / self.efficiency
+                grid_pool = max(grid_pool - removed * f, 0.0)
+                pv_pool = max(pv_pool - removed * (1 - f), 0.0)
+
+        discharge_revenue = np.sum(grid_share * discharge_to_load * price) * dt_hour
+        avoid_curtailment = np.sum((1.0 - grid_share) * discharge_to_load * price) * dt_hour
+        grid_cost = np.sum(grid_charge * price) * dt_hour
+        feed_in_revenue = np.sum((discharge_to_grid - charge_from_pv) * feed_in_tariff) * dt_hour
+
+        net_revenue = discharge_revenue + avoid_curtailment - grid_cost + feed_in_revenue
+
+        return {
+            'discharge_revenue': round(float(discharge_revenue), 2),
+            'avoid_curtailment': round(float(avoid_curtailment), 2),
+            'grid_cost': round(float(grid_cost), 2),
+            'feed_in_revenue': round(float(feed_in_revenue), 2),
+            'net_revenue': round(float(net_revenue), 2)
+        }
+
+    def get_soc_curve(self):
+        """返回SOC变化序列"""
+        if not self.soc_curve:
+            raise ValueError("请先运行optimize方法生成策略")
+        return self.soc_curve
+
+def generate_time_prices(n_records, sharp_price, peak_price, flat_price, valley_price,
+                         timestamps=None):
+    """生成分时电价列表
+
+    timestamps: 各行的真实时间序列。给定时按实际小时取电价；缺省退回
+    行号 % 24 —— 只有数据从 00:00 起连续整点排列时才等价于真实时间，
+    序列起点不是午夜（如 05:30 起）或存在空洞时会整体错位。
+    """
+    time_slots = {
+        "peak": [(7, 11), (17, 21)],
+        "flat": [(12, 16)],
+        "valley": [(22, 24), (0, 6)],
+        "sharp": [(10, 11), (19, 20)]
+    }
+
+    hours = None
+    if timestamps is not None and len(timestamps) == n_records:
+        hs = [getattr(t, 'hour', None) for t in timestamps]
+        if all(h is not None for h in hs):
+            hours = [int(h) for h in hs]
+
+    time_prices = []
+    for i in range(n_records):
+        hour = hours[i] if hours is not None else i % 24
+
+        in_sharp = any(start <= hour < end for start, end in time_slots["sharp"])
+        if in_sharp:
+            time_prices.append(sharp_price)
+            continue
+
+        in_peak = any(start <= hour < end for start, end in time_slots["peak"])
+        if in_peak:
+            time_prices.append(peak_price)
+            continue
+
+        in_flat = any(start <= hour < end for start, end in time_slots["flat"])
+        if in_flat:
+            time_prices.append(flat_price)
+            continue
+
+        time_prices.append(valley_price)
+
+    return time_prices
+
+def generate_analysis_suggestions(df_clean):
+    """生成光伏发电分析建议"""
+    suggestions = []
+
+    if 'TEMPERATURE' in df_clean.columns:
+        avg_temp = df_clean['TEMPERATURE'].mean()
+        max_temp = df_clean['TEMPERATURE'].max()
+        min_temp = df_clean['TEMPERATURE'].min()
+
+        cold_days = (df_clean['TEMPERATURE'] < 0).sum()
+        hot_days = (df_clean['TEMPERATURE'] > 35).sum()
+        total_days = len(df_clean)
+
+        cold_ratio = cold_days / total_days if total_days > 0 else 0
+        hot_ratio = hot_days / total_days if total_days > 0 else 0
+
+        if avg_temp < 5 and cold_ratio > 0.3:
+            suggestions.append({
+                'type': 'temperature',
+                'title': '低温环境应对建议',
+                'content': f'数据依据：当地平均温度 {avg_temp:.1f}℃，最低温度 {min_temp:.1f}℃，{cold_ratio:.1%}的时间低于0℃。\n建议：\n1. 定期检查组件结冰情况：冬季注意清理组件表面积雪\n2. 确保逆变器正常启动：低温可能影响逆变器启动性能\n3. 检查电缆绝缘：低温可能导致电缆变脆，定期检查绝缘状况'
+            })
+        elif avg_temp > 20 and hot_ratio > 0.1:
+            suggestions.append({
+                'type': 'temperature',
+                'title': '高温环境应对建议',
+                'content': f'数据依据：当地平均温度 {avg_temp:.1f}℃，最高温度 {max_temp:.1f}℃，{hot_ratio:.1%}的时间高于35℃。\n建议：\n1. 优化组件通风：确保组件间留有足够间隙，避免热量积聚\n2. 检查逆变器散热：确保逆变器通风良好，避免长时间高温运行\n3. 考虑安装遮阳设施：在极端高温时段可临时遮阳\n4. 调整运行策略：高温时段可适当降低输出功率，保护设备'
+            })
+        elif min_temp < 0 and max_temp > 35:
+            suggestions.append({
+                'type': 'temperature',
+                'title': '温差较大环境应对建议',
+                'content': f'数据依据：当地平均温度 {avg_temp:.1f}℃，温度范围 {min_temp:.1f}℃ 至 {max_temp:.1f}℃。\n建议：\n1. 冬季注意组件结冰情况，清理积雪\n2. 夏季确保组件通风，避免高温运行\n3. 全年定期检查设备状态，适应温度变化'
+            })
+        else:
+            suggestions.append({
+                'type': 'temperature',
+                'title': '温度环境适宜',
+                'content': f'数据依据：当地平均温度 {avg_temp:.1f}℃，温度范围 {min_temp:.1f}℃ 至 {max_temp:.1f}℃。\n建议：保持当前运行状态，定期检查组件温度分布，确保无异常热点。'
+            })
+
+    if 'GLOBAL_HORIZONTAL_IRRADIANCE' in df_clean.columns:
+        avg_irradiance = df_clean['GLOBAL_HORIZONTAL_IRRADIANCE'].mean()
+        max_irradiance = df_clean['GLOBAL_HORIZONTAL_IRRADIANCE'].max()
+
+        if avg_irradiance > 500:
+            suggestions.append({
+                'type': 'warning',
+                'title': '高辐照地区组件角度建议',
+                'content': f'数据依据：当地平均辐照度 {avg_irradiance:.1f} W/m²，最大辐照度 {max_irradiance:.1f} W/m²。\n建议：\n1. 组件倾角：建议采用当地纬度角，以最大化年发电量\n2. 夏季调整：夏季可适当减小倾角，避免正午过热\n3. 冬季调整：冬季可适当增大倾角，提高对低角度阳光的捕获\n4. 跟踪系统：考虑安装单轴或双轴跟踪系统，进一步提高发电效率'
+            })
+        elif avg_irradiance > 200:
+            suggestions.append({
+                'type': 'warning',
+                'title': '中等辐照地区组件角度建议',
+                'content': f'数据依据：当地平均辐照度 {avg_irradiance:.1f} W/m²，最大辐照度 {max_irradiance:.1f} W/m²。\n建议：\n1. 组件倾角：采用当地纬度角 + 5°，提高冬季发电量\n2. 阵列间距：确保冬季无遮挡，间距适当增大\n3. 清洁周期：根据当地环境，每2-3个月清洁一次组件'
+            })
+        else:
+            suggestions.append({
+                'type': 'warning',
+                'title': '低辐照地区优化建议',
+                'content': f'数据依据：当地平均辐照度 {avg_irradiance:.1f} W/m²，最大辐照度 {max_irradiance:.1f} W/m²。\n建议：\n1. 组件倾角：采用当地纬度角 + 10°，最大化冬季发电\n2. 组件选择：选择低辐照性能好的组件\n3. 系统设计：优化系统配置，减少损耗\n4. 清洁频率：增加清洁频率，确保组件表面清洁'
+            })
+
+    if 'WINDSPEED' in df_clean.columns:
+        avg_wind = df_clean['WINDSPEED'].mean()
+        max_wind = df_clean['WINDSPEED'].max()
+
+        if avg_wind > 5:
+            suggestions.append({
+                'type': 'wind',
+                'title': '高风速地区清洁建议',
+                'content': f'数据依据：当地平均风速 {avg_wind:.1f} m/s，最大风速 {max_wind:.1f} m/s。\n建议：\n1. 清洁周期：高风速可自然清洁组件，建议每3-4个月清洁一次\n2. 组件固定：确保组件固定牢固，定期检查支架和紧固件\n3. 风致振动：检查组件是否有异常振动，必要时加固支架'
+            })
+        elif avg_wind > 2:
+            suggestions.append({
+                'type': 'wind',
+                'title': '中等风速地区清洁建议',
+                'content': f'数据依据：当地平均风速 {avg_wind:.1f} m/s，最大风速 {max_wind:.1f} m/s。\n建议：\n1. 清洁周期：每2-3个月清洁一次组件\n2. 雨后检查：雨后检查组件表面，如有污渍及时清理\n3. 季节性调整：风沙季节增加清洁频率'
+            })
+        else:
+            suggestions.append({
+                'type': 'wind',
+                'title': '低风速地区清洁建议',
+                'content': f'数据依据：当地平均风速 {avg_wind:.1f} m/s，最大风速 {max_wind:.1f} m/s。\n建议：\n1. 清洁周期：每1-2个月清洁一次组件\n2. 清洁方法：使用专业清洁剂，确保清洁彻底\n3. 防尘措施：考虑安装防尘网，减少灰尘积累'
+            })
+
+    if 'POWER' in df_clean.columns and 'GLOBAL_HORIZONTAL_IRRADIANCE' in df_clean.columns:
+        df_efficiency = df_clean[(df_clean['GLOBAL_HORIZONTAL_IRRADIANCE'] > 0) & (df_clean['POWER'] > 0)].copy()
+        if len(df_efficiency) > 0:
+            avg_efficiency = (df_efficiency['POWER'].mean() / df_efficiency['GLOBAL_HORIZONTAL_IRRADIANCE'].mean()) * 100
+
+            if avg_efficiency > 20:
+                suggestions.append({
+                    'type': 'success',
+                    'title': '发电效率优秀',
+                    'content': f'数据依据：平均发电效率 {avg_efficiency:.1f}%。\n建议：\n1. 保持当前运行状态，继续优化系统\n2. 定期监测效率变化，确保系统稳定运行\n3. 考虑使用更高效的组件，进一步提高发电效率'
+                })
+            elif avg_efficiency > 15:
+                suggestions.append({
+                    'type': 'info',
+                    'title': '发电效率良好',
+                    'content': f'数据依据：平均发电效率 {avg_efficiency:.1f}%。\n建议：\n1. 检查组件清洁度，确保无灰尘覆盖\n2. 优化逆变器设置，提高转换效率\n3. 检查电缆连接，减少传输损耗\n4. 定期维护系统，确保各部件正常运行'
+                })
+            else:
+                suggestions.append({
+                    'type': 'warning',
+                    'title': '发电效率偏低',
+                    'content': f'数据依据：平均发电效率 {avg_efficiency:.1f}%。\n建议：\n1. 全面检查组件，排除故障组件\n2. 检查逆变器工作状态，确保正常运行\n3. 优化系统配置，减少损耗\n4. 考虑组件清洗和维护\n5. 检查是否存在阴影遮挡问题'
+                })
+
+    suggestions.append({
+        'type': 'info',
+        'title': '系统维护建议',
+        'content': '基于当地地理环境分析，建议：\n1. 定期检查：每月进行一次系统全面检查\n2. 组件清洁：根据当地环境1-3个月清洁一次\n3. 逆变器维护：每半年检查一次逆变器状态\n4. 电缆检查：每季度检查一次电缆绝缘和连接\n5. 接地检测：每年进行一次接地电阻测试\n6. 性能评估：每半年进行一次系统性能评估'
+    })
+
+    if not suggestions:
+        suggestions.append({
+            'type': 'info',
+            'title': '系统运行正常',
+            'content': '基于当前数据分析，系统运行状态良好。建议继续保持定期维护和监控，根据当地地理环境特点优化系统运行。'
+        })
+
+    return suggestions
+
+@router.post("/analyze")
+async def analyze_scenario(
+    request: ScenarioAnalysisRequest,
+    access_token: Optional[str] = Cookie(None),
+    authorization: Optional[str] = Header(None),
+):
+    """分析应用场景：优先用户站点已上传数据；可选自定义电价。"""
+    try:
+        from backend.api.sites import _require_user
+        from utils import site_store
+
+        user = _require_user(access_token, authorization)
+
+        site = None
+        source_label = 'global_demo'
+        if request.site_id:
+            site = site_store.get_site_readable(int(request.site_id), user['id'])
+            if not site:
+                return {'success': False, 'error': '电站不存在或无权访问'}
+
+        # ── 电价：自定义 > 站点保存 > 省份库 > 默认 ──
+        custom = request.prices or {}
+        sharp_price = custom.get('sharp')
+        peak_price = custom.get('peak')
+        flat_price = custom.get('flat')
+        valley_price = custom.get('valley')
+        feed_in_custom = custom.get('feed_in')
+
+        lat = lon = None
+        if site:
+            lat, lon = site['lat'], site['lon']
+            sp = site.get('prices') or {}
+            if sharp_price is None:
+                sharp_price = sp.get('sharp')
+            if peak_price is None:
+                peak_price = sp.get('peak')
+            if flat_price is None:
+                flat_price = sp.get('flat')
+            if valley_price is None:
+                valley_price = sp.get('valley')
+            if feed_in_custom is None:
+                feed_in_custom = sp.get('feed_in')
+
+        if lat is None and request.pv_file:
+            lat, lon = extract_coordinates(request.pv_file)
+
+        province = get_province_by_coordinates(lat, lon) if lat and lon else '未知'
+        province_prices = get_province_prices(province) if province != '未知' else None
+
+        def _pick(custom_val, key, default):
+            if custom_val is not None:
+                return float(custom_val)
+            if province_prices:
+                return float(province_prices.get(key, default))
+            return float(default)
+
+        sharp_price = _pick(sharp_price, 'sharp', 1.2)
+        peak_price = _pick(peak_price, 'peak', 1.0)
+        flat_price = _pick(flat_price, 'flat', 0.6)
+        valley_price = _pick(valley_price, 'valley', 0.3)
+        feed_in_tariff = _pick(feed_in_custom, 'feed_in', 0.4)
+
+        # ── 功率序列 ──
+        power_pred = None
+        df = None
+        if site:
+            gen = site_store.get_generation(site['id'], request.start_date, request.end_date)
+            # 用户站有数据但所选日期无交集时，回退到全量（导入联动场景）
+            if (gen is None or len(gen) == 0) and (request.start_date or request.end_date):
+                gen = site_store.get_generation(site['id'])
+            if gen is not None and len(gen) > 0:
+                power_pred = pd.DataFrame({
+                    'DATATIME': gen['ts'].values,
+                    'POWER_pred': gen['power_kw'].values,
+                })
+                source_label = 'user_upload'
+                df = gen.rename(columns={'power_kw': 'POWER'}).copy()
+                if 'TEMPERATURE' not in df.columns:
+                    df['TEMPERATURE'] = 0
+                if 'GLOBAL_HORIZONTAL_IRRADIANCE' not in df.columns:
+                    df['GLOBAL_HORIZONTAL_IRRADIANCE'] = 0
+
+        if power_pred is None:
+            if not request.pv_file:
+                if site:
+                    return {
+                        'success': False,
+                        'error': '该电站尚未上传发电数据，请先在「数据导入」上传，或改用演示数据',
+                    }
+                return {'success': False, 'error': '缺少 pv_file 或 site_id'}
+            df = load_pv_data(request.pv_file)
+            if df is None or len(df) == 0:
+                return {'success': False, 'error': '无法加载数据'}
+            if request.start_date and request.end_date:
+                try:
+                    start_dt = pd.to_datetime(request.start_date)
+                    end_dt = pd.to_datetime(request.end_date)
+                    if end_dt == pd.to_datetime(end_dt.strftime('%Y-%m-%d')):
+                        end_dt = end_dt + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                    df = df[(df['DATATIME'] >= start_dt) & (df['DATATIME'] <= end_dt)]
+                except Exception:
+                    pass
+            if len(df) == 0:
+                return {'success': False, 'error': '所选日期范围内无数据'}
+            power_pred = pd.DataFrame({
+                'DATATIME': df['DATATIME'].values,
+                'POWER_pred': df['POWER'].values if 'POWER' in df.columns else np.zeros(len(df)),
+            })
+
+        n_records = len(power_pred)
+
+        span_days = 1.0 / 24
+        if n_records >= 2 and pd.api.types.is_datetime64_any_dtype(power_pred['DATATIME']):
+            span_seconds = (power_pred['DATATIME'].max() - power_pred['DATATIME'].min()).total_seconds()
+            span_days = max(span_seconds / 86400, 1.0 / 24)
+
+        avg_temp = float(df['TEMPERATURE'].mean()) if df is not None and 'TEMPERATURE' in df.columns else 0
+        avg_irr = float(df['GLOBAL_HORIZONTAL_IRRADIANCE'].mean()) if df is not None and 'GLOBAL_HORIZONTAL_IRRADIANCE' in df.columns else 0
+        avg_power = float(power_pred['POWER_pred'].mean())
+
+        scenario = 'general'
+        scenario_name = '综合场景'
+        scenario_icon = '📍'
+        scenario_desc = '适用于一般光伏系统'
+        if avg_irr > 500:
+            scenario, scenario_name, scenario_icon = 'high_irradiance', '高辐照地区', '☀️'
+            scenario_desc = '年均辐照度高，适合建设大型光伏电站'
+        elif 0 < avg_irr < 200:
+            scenario, scenario_name, scenario_icon = 'low_irradiance', '低辐照地区', '🌤️'
+            scenario_desc = '年均辐照度较低，需要优化系统设计'
+        elif avg_temp < 5:
+            scenario, scenario_name, scenario_icon = 'cold_climate', '寒冷气候', '❄️'
+            scenario_desc = '冬季低温，需要考虑组件除雪和防冻'
+        elif avg_temp > 25:
+            scenario, scenario_name, scenario_icon = 'hot_climate', '炎热气候', '🔥'
+            scenario_desc = '夏季高温，影响组件效率和散热'
+
+        suggestions = generate_analysis_suggestions(df) if df is not None else [{
+            'type': 'info',
+            'title': '基于用户上传数据',
+            'content': '分析使用您本地上传的发电功率序列，未依赖全局演示数据集。',
+        }]
+
+        time_prices = generate_time_prices(
+            n_records, sharp_price, peak_price, flat_price, valley_price,
+            timestamps=power_pred['DATATIME'])
+
+        if n_records >= 2 and pd.api.types.is_datetime64_any_dtype(power_pred['DATATIME']):
+            time_diffs = power_pred['DATATIME'].diff().dropna()
+            if len(time_diffs) > 0:
+                median_diff = time_diffs.median()
+                time_step_minutes = int(median_diff.total_seconds() / 60) if hasattr(median_diff, 'total_seconds') else 10
+            else:
+                time_step_minutes = 10
+        else:
+            time_step_minutes = 10
+
+        load_type_map = {
+            'industrial': 'industrial',
+            'commercial': 'commercial',
+            'residential': 'residential',
+        }
+        load_profile = None
+        if request.load_type in load_type_map:
+            load_profile = generate_typical_load_profile(n_records, load_type_map[request.load_type])
+
+        optimizer = EnergyStorageOptimizer(
+            capacity=request.battery_capacity,
+            power=request.battery_power,
+            initial_soc=request.initial_soc,
+            efficiency=request.battery_efficiency,
+            load_ratio=request.load_ratio,
+            load_profile=load_profile,
+        )
+        strategy = optimizer.optimize(power_pred, time_prices, time_step_minutes=time_step_minutes)
+        revenue = optimizer.calculate_revenue(feed_in_tariff=feed_in_tariff, time_step_minutes=time_step_minutes)
+        revenue['days'] = round(span_days, 2)
+        revenue['daily_revenue'] = round(revenue['net_revenue'] / span_days, 2)
+        revenue['revenue_per_kwh'] = round(
+            revenue['net_revenue'] / (request.battery_capacity or 1), 2)
+        soc_curve = optimizer.get_soc_curve()
+
+        # 对比档位按用户所选容量缩放（0.5x/1x/2x/3x，取整到 10 的倍数）
+        base_cap = int(request.battery_capacity or 0) or 1000
+        c_rate = (float(request.battery_power) / base_cap) if base_cap and request.battery_power else 0.5
+        caps = sorted(set(max(int(round(base_cap * m / 10)) * 10, 10) for m in (0.5, 1, 2, 3)))
+        comparison_results = []
+        for cap in caps:
+            opt = EnergyStorageOptimizer(
+                capacity=cap,
+                power=round(cap * c_rate),
+                initial_soc=request.initial_soc,
+                efficiency=request.battery_efficiency,
+                load_ratio=request.load_ratio,
+                load_profile=load_profile,
+            )
+            strat = opt.optimize(power_pred, time_prices, time_step_minutes=time_step_minutes)
+            rev = opt.calculate_revenue(feed_in_tariff=feed_in_tariff, time_step_minutes=time_step_minutes)
+            comparison_results.append({
+                'capacity': cap,
+                'revenue': rev['net_revenue'],
+                'soc_std': float(strat['SOC'].std()),
+                'daily_revenue': round(rev['net_revenue'] / span_days, 2),
+                'revenue_per_kwh': round(rev['net_revenue'] / cap, 2),
+            })
+
+        date_range = {'start': '', 'end': ''}
+        if power_pred is not None and len(power_pred):
+            date_range = {
+                'start': str(power_pred['DATATIME'].min())[:10],
+                'end': str(power_pred['DATATIME'].max())[:10],
+            }
+
+        result = {
+            'success': True,
+            'data_source': source_label,
+            'site': ({
+                'id': site['id'],
+                'name': site['name'],
+                'visibility': site.get('visibility', 'private'),
+                'read_only': site.get('read_only', False),
+            } if site else None),
+            'scenario': {
+                'name': scenario_name,
+                'icon': scenario_icon,
+                'description': scenario_desc,
+            },
+            'province': province,
+            'province_prices': province_prices,
+            'prices_used': {
+                'sharp': sharp_price,
+                'peak': peak_price,
+                'flat': flat_price,
+                'valley': valley_price,
+                'feed_in': feed_in_tariff,
+            },
+            'strategy': strategy.to_dict('records'),
+            'revenue': revenue,
+            'soc_curve': soc_curve,
+            'suggestions': suggestions,
+            'data_summary': {
+                'total_records': n_records,
+                'date_range': date_range,
+                'avg_power': round(avg_power, 2),
+                'avg_irradiance': round(avg_irr, 2),
+                'avg_temperature': round(avg_temp, 2),
+            },
+            'comparison': comparison_results,
+        }
+        return convert_numpy_types(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {'success': False, 'error': str(e)}
+
+# =============================================================================
+# 光伏自发自用收益预估（基于 hybrid v2 物理+ML 预测发电量）
+# =============================================================================
+
+# 分时时段（整点小时，[起,止)），可按当地政策调整
+TOU_SLOTS = {
+    'sharp':  [(10, 11), (19, 20)],          # 尖峰
+    'peak':   [(7, 10), (17, 19)],           # 高峰
+    'flat':   [(11, 17), (20, 22)],          # 平段
+    'valley': [(22, 24), (0, 7)],            # 低谷
+}
+# 默认电价（元/kWh，一般工商业参考值，前端提示用户以电费单为准）
+DEFAULT_PRICES = {
+    'sharp': 1.30, 'peak': 1.10, 'flat': 0.75, 'valley': 0.35, 'feed_in': 0.40,
+}
+
+
+def _tou_period(hour: int) -> str:
+    for name, slots in TOU_SLOTS.items():
+        if any(s <= hour < e for s, e in slots):
+            return name
+    return 'flat'
+
+
+class RevenuePrices(BaseModel):
+    sharp: float = DEFAULT_PRICES['sharp']
+    peak: float = DEFAULT_PRICES['peak']
+    flat: float = DEFAULT_PRICES['flat']
+    valley: float = DEFAULT_PRICES['valley']
+    feed_in: float = DEFAULT_PRICES['feed_in']
+
+
+class RevenueEstimateRequest(BaseModel):
+    site_id: int
+    forecast_days: int = 7
+    start: Optional[str] = None
+    end: Optional[str] = None
+    prices: RevenuePrices = RevenuePrices()
+    self_use_ratio: float = 0.8   # 自发自用比例 0~1
+
+
+@router.post("/revenue-estimate")
+def revenue_estimate(
+    request: RevenueEstimateRequest,
+    access_token: Optional[str] = Cookie(None),
+    authorization: Optional[str] = Header(None),
+):
+    """
+    结合预测发电量与峰平谷电价/上网电价/自用比例，计算：
+      自发自用节省电费、余电上网收益、总收益；逐小时曲线与逐日汇总。
+    """
+    from backend.api.sites import _require_user
+    from utils import site_store
+    from utils import hybrid_model as hm
+    from utils.weather.forecast import fetch_open_meteo_forecast
+    from utils.weather import store as wstore
+
+    user = _require_user(access_token, authorization)
+    # 只读：本人或已分享站点
+    site = site_store.get_site_readable(request.site_id, user['id'])
+    if not site:
+        raise HTTPException(status_code=404, detail='电站不存在或无权访问')
+
+    ratio = min(max(float(request.self_use_ratio), 0.0), 1.0)
+    prices = request.prices.model_dump()
+
+    # 取气象 + 混合预测
+    if request.start and request.end:
+        wx, meta = wstore.get_weather(site['lat'], site['lon'], request.start, request.end)
+        if wx.empty:
+            return {'success': False, 'error': '本地无该时间段气象缓存，请先回填 NASA POWER 数据'}
+        source = 'nasa_power'
+    else:
+        try:
+            wx = fetch_open_meteo_forecast(
+                site['lat'], site['lon'],
+                forecast_days=max(1, min(int(request.forecast_days), 16)))
+        except Exception as e:
+            return {'success': False, 'error': f'天气预报获取失败：{str(e)}'}
+        meta = {'source': 'open_meteo'}
+        source = 'open_meteo'
+
+    result = hm.predict_hybrid(wx, site)
+    frame = result['frame']
+
+    price_map = {'sharp': prices['sharp'], 'peak': prices['peak'],
+                 'flat': prices['flat'], 'valley': prices['valley']}
+    feed_p = float(prices['feed_in'])
+
+    rows = []
+    period_energy = {k: 0.0 for k in price_map}
+    total_self = total_feed = total_saving = total_feed_rev = 0.0
+
+    for _, r in frame.iterrows():
+        e = float(r['p_final_kw'])          # 逐小时发电量 kWh
+        hour = pd.Timestamp(r['ts']).hour
+        period = _tou_period(hour)
+        retail = price_map[period]
+        e_self = e * ratio
+        e_feed = e * (1.0 - ratio)
+        saving = e_self * retail
+        feed_rev = e_feed * feed_p
+        period_energy[period] += e
+        total_self += e_self
+        total_feed += e_feed
+        total_saving += saving
+        total_feed_rev += feed_rev
+        rows.append({
+            'ts': str(pd.Timestamp(r['ts'])),
+            'energy_kwh': round(e, 3),
+            'period': period,
+            'retail_price': retail,
+            'self_use_kwh': round(e_self, 3),
+            'feed_kwh': round(e_feed, 3),
+            'saving_yuan': round(saving, 2),
+            'feed_revenue_yuan': round(feed_rev, 2),
+            'total_yuan': round(saving + feed_rev, 2),
+        })
+
+    # 逐日汇总
+    daily = {}
+    for row in rows:
+        day = row['ts'][:10]
+        d = daily.setdefault(day, {'date': day, 'energy_kwh': 0.0, 'self_use_kwh': 0.0,
+                                   'feed_kwh': 0.0, 'saving_yuan': 0.0,
+                                   'feed_revenue_yuan': 0.0, 'total_yuan': 0.0})
+        d['energy_kwh'] += row['energy_kwh']
+        d['self_use_kwh'] += row['self_use_kwh']
+        d['feed_kwh'] += row['feed_kwh']
+        d['saving_yuan'] += row['saving_yuan']
+        d['feed_revenue_yuan'] += row['feed_revenue_yuan']
+        d['total_yuan'] += row['total_yuan']
+    daily_list = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in d.items()}
+                  for d in daily.values()]
+
+    total_energy = float(frame['p_final_kw'].sum())
+
+    return convert_numpy_types({
+        'success': True,
+        'source': source,
+        'has_ml': result['has_ml'],
+        'site': {'name': site['name'], 'kwp': site['kwp']},
+        'assumptions': {'self_use_ratio': ratio,
+                        'prices': prices,
+                        'slots': {k: v for k, v in TOU_SLOTS.items()}},
+        'summary': {
+            'days': len(daily_list),
+            'total_energy_kwh': round(total_energy, 1),
+            'self_use_kwh': round(total_self, 1),
+            'feed_kwh': round(total_feed, 1),
+            'saving_yuan': round(total_saving, 2),
+            'feed_revenue_yuan': round(total_feed_rev, 2),
+            'total_revenue_yuan': round(total_saving + total_feed_rev, 2),
+            'avg_price_per_kwh': round(total_saving / max(total_self, 1e-9), 3),
+            'period_energy_kwh': {k: round(v, 1) for k, v in period_energy.items()},
+        },
+        'daily': daily_list,
+        'hourly': rows,
+    })

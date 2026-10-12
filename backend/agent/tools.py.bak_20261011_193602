@@ -1,0 +1,1205 @@
+"""
+backend/agent/tools.py
+======================
+阶段二 · DuMate 智能体闭环：8 个原子工具
+
+设计原则（对应任务书 2.2）：
+- 优先复用 FastAPI 现有业务函数 / utils，不在本层重写预测或收益逻辑
+- 每个工具返回统一契约（success/data/error_code/message/source/elapsed_ms/trace_id）
+- 身份与站点权限在工具端校验（不信任智能体传入的 user_id）
+- 每个工具含超时、缺参、无权、空数据、降级处理
+
+工具清单：
+  1. get_site            站点识别
+  2. check_data_quality  数据质量检查
+  3. get_weather         天气获取（未来 Open-Meteo / 历史 NASA POWER 缓存）
+  4. forecast_power      功率预测（站点→混合预测[物理+ML残差]；数据集文件→iid 模型）
+  5. diagnose_risk       风险诊断
+  6. optimize_storage    储能优化与收益
+  7. search_knowledge    知识库 RAG 检索
+  8. generate_report     结构化报告生成
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import time
+import traceback
+from typing import Any, Dict, List, Optional
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from .contracts import (
+    EC, ToolResult, ok, fail, new_trace_id,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具端鉴权：从 JWT 解析 user（不信任智能体传入的 user_id）
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_user(access_token: Optional[str],
+                 authorization: Optional[str]) -> Optional[Dict[str, Any]]:
+    """从 Cookie/Authorization 解析登录用户；失败返回 None。"""
+    token = access_token
+    if not token and authorization and authorization.startswith('Bearer '):
+        token = authorization[7:].strip()
+    if not token:
+        return None
+    try:
+        import jwt
+        from backend.api.auth import SECRET_KEY, ALGORITHM
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return {'id': int(payload.get('sub')), 'username': payload.get('username')}
+    except Exception:
+        return None
+
+
+def _sync(coro):
+    """同步函数内跑 async 的空转（本层工具均为同步实现，异步封装由状态机负责）。"""
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) get_site —— 站点识别
+# ─────────────────────────────────────────────────────────────────────────────
+def get_site(params: Dict[str, Any], user: Dict[str, Any],
+             trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    from utils import site_store
+    from utils.data_loader import get_data_files
+
+    site_id = params.get('site_id')
+    pv_file = params.get('pv_file')
+    name = params.get('name')
+
+    if site_id is not None:
+        # 用户电站：本人或分享给我的（工具端权限校验，只读分析）
+        site = site_store.get_site_readable(int(site_id), user['id'])
+        if not site:
+            return fail(EC.E_NOT_FOUND, f"电站 {site_id} 不存在或无权访问",
+                        trace_id=trace_id, elapsed_ms=_ms(t0))
+        site['kind'] = 'user_site'
+        return ok(site, source=['site_config'], trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    if pv_file or name:
+        files = []
+        try:
+            files = get_data_files()
+        except Exception:
+            files = []
+        target = None
+        if name:
+            for f in files:
+                if name in f:
+                    target = f
+                    break
+        else:
+            target = pv_file if pv_file in files else next(
+                (f for f in files if f.endswith(pv_file) or pv_file in f), None)
+        if not target:
+            return fail(EC.E_NOT_FOUND,
+                        f"未找到数据集站点「{pv_file or name}」，可用站点：{files[:5]}{'…' if len(files) > 5 else ''}",
+                        trace_id=trace_id, elapsed_ms=_ms(t0))
+        from utils.predictor import parse_pv_filename
+        try:
+            meta = parse_pv_filename(target)
+        except Exception:
+            meta = {}
+        return ok({
+            'kind': 'dataset_site',
+            'pv_file': target,
+            'display_name': target,
+            'provider': {'latitude': meta.get('latitude'),
+                         'longitude': meta.get('longitude'),
+                         'elevation': meta.get('elevation'),
+                         'kwp': meta.get('capacity_kwp', 1.0),
+                         'tilt': meta.get('tilt'), 'azimuth': meta.get('azimuth')},
+            'model_ready': _dataset_model_ready(target),
+        }, source=['data_loader'], trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    return fail(EC.E_BAD_PARAM, "至少提供 site_id / pv_file / name 之一",
+                trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+def _dataset_model_ready(display_name: str) -> bool:
+    import re
+    from utils.predictor import get_safe_name
+    base = os.path.join('models', get_safe_name(display_name))
+    iid_dir = os.path.join(base, 'iid_transformer_lstm')
+    return os.path.isdir(iid_dir) and any(
+        f.startswith('interval_') and f.endswith('.pt')
+        for f in (os.listdir(iid_dir) if os.path.isdir(iid_dir) else []))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) check_data_quality —— 数据质量检查
+# ─────────────────────────────────────────────────────────────────────────────
+def check_data_quality(params: Dict[str, Any], user: Dict[str, Any],
+                       trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    pv_file = params.get('pv_file')
+    site_id = params.get('site_id')
+    start_date = params.get('start_date')
+    end_date = params.get('end_date')
+    capacity_kwp = params.get('capacity_kwp')
+
+    if not pv_file and site_id is None:
+        return fail(EC.E_BAD_PARAM, "缺少 pv_file 或 site_id",
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    from utils.data_loader import load_pv_data_by_date_range
+    from utils.units import parse_capacity_kwp, power_range_check
+
+    df = None
+    err = None
+    cap = capacity_kwp
+    try:
+        if site_id is not None and not pv_file:
+            # 用户电站：读上传的发电数据（ts / power_kw → DATATIME / POWER）
+            from utils import site_store
+            site = site_store.get_site_readable(int(site_id), user['id'])
+            if not site:
+                return fail(EC.E_NOT_FOUND, f"电站 {site_id} 不存在或无权访问",
+                            trace_id=trace_id, elapsed_ms=_ms(t0))
+            gen = site_store.get_generation(int(site_id), start_date, end_date)
+            if gen is None or gen.empty:
+                return fail(EC.E_EMPTY_DATA, "该电站尚未上传发电数据，请先在「数据导入」上传",
+                            trace_id=trace_id, elapsed_ms=_ms(t0))
+            df = gen.rename(columns={'ts': 'DATATIME', 'power_kw': 'POWER'})
+            cap = cap or float(site.get('kwp') or 0) or 1.0
+        else:
+            # T6 降级：取数失败时尝试全量加载
+            try:
+                df = load_pv_data_by_date_range(pv_file, start_date, end_date)
+            except Exception as e:
+                err = str(e)
+            if df is None or df.empty:
+                # 无日期参数时回退全量
+                from utils.data_loader import load_pv_data
+                try:
+                    df = load_pv_data(pv_file)
+                except Exception as e2:
+                    err = f"{err or ''}；全量加载失败: {e2}"
+                if df is None or df.empty:
+                    return fail(EC.E_EMPTY_DATA, f"数据为空：{err}",
+                                trace_id=trace_id, elapsed_ms=_ms(t0))
+            cap = cap or parse_capacity_kwp(pv_file)
+
+        total = len(df)
+        if total == 0:
+            return fail(EC.E_EMPTY_DATA, "数据为空", trace_id=trace_id, elapsed_ms=_ms(t0))
+
+        dt_col = 'DATATIME' if 'DATATIME' in df.columns else df.columns[0]
+        power_col = 'POWER' if 'POWER' in df.columns else None
+        ghi_col = next((c for c in ('辐照度', 'GHI', 'ghi') if c in df.columns), None)
+
+        # 时间间隔（小时）
+        ts = df[dt_col]
+        dt_series = None
+        try:
+            dt_series = ts.astype('datetime64[ns]')
+            intervals = dt_series.diff().dropna().dt.total_seconds() / 3600
+            median_h = float(intervals.median()) if len(intervals) else 0
+            max_gap_h = float(intervals.max()) if len(intervals) else 0
+        except Exception:
+            median_h, max_gap_h = 0.0, 0.0
+
+        # 缺失率
+        missing = {}
+        if power_col:
+            missing['POWER'] = round(float(df[power_col].isna().mean() * 100), 2)
+        if ghi_col:
+            missing[ghi_col] = round(float(df[ghi_col].isna().mean() * 100), 2)
+
+        # 功率越界（物理口径）
+        out_of_range = 0
+        if power_col:
+            pow_valid = df[power_col].dropna()
+            if len(pow_valid):
+                mask = pow_valid < 0
+                pos = pow_valid[~mask]
+                if len(pos):
+                    mask = mask.reindex(pow_valid.index).fillna(False)
+                # 重新计算正越界
+                over = float((pos.astype(float) > cap * 1.2).mean() * 100) if len(pos) else 0.0
+                neg = float((pow_valid.astype(float) < 0).mean() * 100) if len(pow_valid) else 0.0
+                out_of_range = round(over + neg, 2)
+
+        quality_level = 'good'
+        if missing and any(v > 5 for v in missing.values()):
+            quality_level = 'warn'
+        if out_of_range > 1 or max_gap_h > 6:
+            quality_level = 'bad'
+
+        suggestion = []
+        if missing and any(v > 5 for v in missing.values()):
+            suggestion.append('存在明显缺失，建议回填 NASA POWER 气象或核对原始数据')
+        if out_of_range > 1:
+            suggestion.append('存在功率越界数据，建议按物理范围（0~1.2×容量）清洗')
+        if max_gap_h > 6:
+            suggestion.append(f'存在 {max_gap_h:.0f} 小时以上的时间断档，影响模型时序特征')
+
+        return ok({
+            'pv_file': pv_file,
+            'site_id': site_id,
+            'total_records': int(total),
+            'start': str(dt_series.min())[:10] if dt_series is not None else '',
+            'end': str(dt_series.max())[:10] if dt_series is not None else '',
+            'interval_hours': round(median_h, 2) if median_h else 1.0,
+            'max_gap_hours': round(max_gap_h, 2) if max_gap_h else 0.0,
+            'missing_rate_pct': missing,
+            'out_of_range_pct': out_of_range,
+            'capacity_kwp': float(cap),
+            'quality_level': quality_level,
+            'suggestions': suggestion,
+        }, source=['site_store.user_generation'] if site_id is not None and not pv_file
+                   else ['data/pv_data.duckdb'],
+            trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'数据质量检查失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) get_weather —— 天气获取
+# ─────────────────────────────────────────────────────────────────────────────
+def get_weather(params: Dict[str, Any], user: Dict[str, Any],
+                trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    lat = params.get('latitude')
+    lon = params.get('longitude')
+    start_date = params.get('start_date')
+    end_date = params.get('end_date')
+    forecast_days = int(params.get('forecast_days') or 7)
+    src = params.get('source') or 'auto'
+
+    if lat is None or lon is None:
+        return fail(EC.E_BAD_PARAM, '缺少 latitude/longitude',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    try:
+        if start_date and end_date:
+            # 历史：NASA POWER 缓存（T6 降级：远程失败但缓存可用）
+            from utils.weather import store as wstore
+            try:
+                df, meta = wstore.get_weather(lat, lon, start_date, end_date)
+            except Exception as e:
+                from utils.weather.store import get_cached
+                df = get_cached(lat, lon, start_date, end_date)
+                if df is None or df.empty:
+                    return fail(EC.E_UPSTREAM, f'历史天气拉取失败且无缓存: {str(e)}',
+                                trace_id=trace_id, elapsed_ms=_ms(t0))
+                meta = {'warning': '历史天气远程拉取失败，已用本地缓存'}
+            source = ['nasa_power']
+        else:
+            # 未来：Open-Meteo（重试一次）
+            from utils.weather.forecast import fetch_open_meteo_forecast
+            last_err = None
+            df = None
+            for attempt in range(2):
+                try:
+                    df = fetch_open_meteo_forecast(
+                        lat, lon, forecast_days=max(1, min(int(forecast_days), 16)))
+                    break
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5)
+            if df is None or df.empty:
+                return fail(EC.E_UPSTREAM,
+                            f'Open-Meteo 未来天气获取失败（重试 1 次）: {last_err}',
+                            trace_id=trace_id, elapsed_ms=_ms(t0))
+            meta = {'source': 'open_meteo'}
+            source = ['open_meteo']
+
+        rows = df.to_dict('records')
+        # 精简输出：只保留必要列
+        cols = [c for c in ('ts', 'ghi', 't2m', 'ws2m', 'DATATIME', '辐照度', '气温', '风速',
+                            'pvgis_ghi', 'time') if c in df.columns]
+        if not cols and len(rows):
+            cols = list(df.columns)
+        compact = [{str(c): (None if r[c] is None or (isinstance(r[c], float) and r[c] != r[c]) else r[c])
+                    for c in cols} for r in rows]
+
+        return ok({
+            'latitude': float(lat),
+            'longitude': float(lon),
+            'count': int(len(df)),
+            'sample': compact[:120],
+            'meta': {k: v for k, v in meta.items() if k != 'warning'},
+            'warning': meta.get('warning'),
+        }, source=source, trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'天气获取失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) forecast_power —— 功率预测
+# ─────────────────────────────────────────────────────────────────────────────
+def forecast_power(params: Dict[str, Any], user: Dict[str, Any],
+                   trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    site_id = params.get('site_id')
+    pv_file = params.get('pv_file')
+    start_date = params.get('start_date')
+    end_date = params.get('end_date')
+    forecast_days = int(params.get('forecast_days') or 7)
+    mode = params.get('mode') or 'future'
+
+    try:
+        if site_id is not None:
+            return _forecast_user_site(site_id, forecast_days, start_date, end_date,
+                                       user, trace_id, t0)
+        if pv_file:
+            return _forecast_dataset(pv_file, start_date, end_date, mode, trace_id, t0)
+        return fail(EC.E_BAD_PARAM, '缺少 site_id 或 pv_file',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'预测失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+def _auto_train_hybrid(site_id, user) -> Optional[Dict[str, Any]]:
+    """无残差模型时后台自动启动一次训练。
+
+    训练是异步的：本次预测仍立即返回物理基准结果，模型落盘后的下一次预测
+    才会用上 ML 残差。任何异常都只降级成一条说明，绝不影响预测本身。
+    """
+    try:
+        from backend.api.prediction import start_hybrid_training
+        # 注意签名顺序：start_hybrid_training(user_id, site_id, ...)
+        out = start_hybrid_training(user['id'], int(site_id), auto=True)
+        if out.get('success'):
+            return {'started': True, 'job_id': out.get('job_id'),
+                    'message': '已后台启动混合残差模型训练，完成后预测将自动使用 ML 残差'}
+        return {'started': False, 'job_id': None,
+                'message': out.get('error') or '未启动训练'}
+    except Exception as e:
+        return {'started': False, 'job_id': None,
+                'message': f'自动训练触发失败：{e}'}
+
+
+def _forecast_user_site(site_id, forecast_days, start_date, end_date,
+                        user, trace_id, t0) -> ToolResult:
+    """用户电站：混合预测（物理基准 + ML 残差），无 ML 自动回退物理。"""
+    from utils import site_store
+    from utils import hybrid_model as hm
+    from utils.weather.forecast import fetch_open_meteo_forecast
+    from utils.weather import store as wstore
+
+    site = site_store.get_site_readable(int(site_id), user['id'])
+    if not site:
+        return fail(EC.E_NOT_FOUND, f'电站 {site_id} 不存在或无权访问',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    if start_date and end_date:
+        # 历史重算
+        wx_df, wx_meta = _safe_weather(wstore.get_weather, site['lat'], site['lon'],
+                                       start_date, end_date)
+        source_kind = 'nasa_power'
+    else:
+        # 未来：fetch_open_meteo_forecast 只返回 DataFrame（不带 meta）
+        try:
+            wx_df = fetch_open_meteo_forecast(
+                site['lat'], site['lon'],
+                max(1, min(int(forecast_days), 16)))
+            wx_meta = {'source': 'open_meteo'}
+        except Exception as e:
+            wx_df, wx_meta = None, str(e)
+        source_kind = 'open_meteo'
+    if wx_df is None or wx_df.empty:
+        return fail(EC.E_UPSTREAM, f'无法获取天气，预测中止（可稍后重试）：{wx_meta}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    result = hm.predict_hybrid(wx_df, site, user_id=user['id'])
+    frame = result['frame']
+    has_ml = result['has_ml']
+    meta = result['meta'] or {}
+
+    # 无残差模型：后台自动启一次训练（异步，不阻塞本次预测）
+    auto_train = None if has_ml else _auto_train_hybrid(site_id, user)
+    warning = None
+    if auto_train and auto_train.get('started'):
+        warning = ('当前无 ML 残差模型，已回退物理模型；'
+                   '已后台启动训练，模型落盘后下一次预测将自动使用 ML 残差')
+
+    daily = (frame.assign(day=frame['ts'].dt.strftime('%Y-%m-%d'))
+             .groupby('day')[['p_phys_kw', 'p_final_kw']].sum().round(2).reset_index())
+    curves = [{'ts': str(pd_Timestamp(r['ts'])),
+               'phys_kw': _safe_num(r['p_phys_kw']),
+               'final_kw': _safe_num(r['p_final_kw'])}
+              for _, r in frame.iterrows()]
+    return ok({
+        'kind': 'user_site_hybrid',
+        'site': {'name': site['name'], 'kwp': site['kwp'],
+                 'tilt': site['tilt'], 'azimuth': site['azimuth']},
+        'has_ml': bool(has_ml),
+        'model_trained_at': meta.get('trained_at'),
+        'weather_source': source_kind,
+        'curves': curves[:240],
+        'daily_energy_kwh': [{'date': r['day'],
+                              'phys_kwh': _safe_num(r['p_phys_kw']),
+                              'final_kwh': _safe_num(r['p_final_kw'])}
+                             for _, r in daily.iterrows()],
+        'total_energy_phys_kwh': _safe_num(frame['p_phys_kw'].sum()),
+        'total_energy_final_kwh': _safe_num(frame['p_final_kw'].sum()),
+        'fallback': 'physics' if not has_ml else None,
+        'auto_train': auto_train,
+    }, source=['hybrid_model', source_kind] + (['ml_model'] if has_ml else ['pvlib_physics']),
+        warning=warning, trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+def _forecast_dataset(pv_file, start_date, end_date, mode, trace_id, t0) -> ToolResult:
+    """内置数据集：iid_transformer_lstm 真实模型推理；无模型则报错提示训练。"""
+    from utils.predictor import predict_pv
+
+    start = start_date or '2023-01-01'
+    end = end_date or '2023-01-07'
+    result, error = predict_pv(pv_file, start, end, model_key='iid_transformer_lstm', mode=mode)
+    if error:
+        # 降级：尝试物理模型
+        try:
+            phys = _dataset_physics_forecast(pv_file, start, end)
+            return ok(phys, source=['pvlib_physics'],
+                      warning=f'ML 模型不可用（{error}），已回退物理模型',
+                      trace_id=trace_id, elapsed_ms=_ms(t0))
+        except Exception:
+            return fail(EC.E_NOT_FOUND, f'模型或数据不可用: {error}',
+                        trace_id=trace_id, elapsed_ms=_ms(t0))
+
+    import pandas as pd
+    preds = []
+    for _, r in result.iterrows():
+        preds.append({
+            'ts': str(pd.Timestamp(r['DATATIME']))[:19],
+            'true_kw': _safe_num(r.get('POWER_true')),
+            'pred_kw': _safe_num(r.get('POWER_pred')),
+        })
+    return ok({
+        'kind': 'dataset_iid',
+        'pv_file': pv_file,
+        'mode': mode,
+        'count': len(preds),
+        'predictions': preds[:240],
+        'model': 'iid_transformer_lstm',
+    }, source=['iid_transformer_lstm'], trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+def _dataset_physics_forecast(pv_file, start, end) -> Dict[str, Any]:
+    """物理模型回退：读取站点数据 + PVGIS 气象计算功率。"""
+    from utils.data_loader import load_pv_data
+    from utils.predictor import parse_pv_filename
+    df = load_pv_data(pv_file)
+    meta = parse_pv_filename(pv_file)
+    phys = compute_physics_from_df(df, meta, start, end)
+    return phys
+
+
+def compute_physics_from_df(df, meta, start, end):
+    from utils.pv_physics import compute_physics_power
+    import pandas as pd
+    lat = meta.get('latitude')
+    lon = meta.get('longitude')
+    tilt = meta.get('tilt')
+    az = meta.get('azimuth')
+    kwp = meta.get('capacity_kwp', 1.0)
+    wx = pd.DataFrame({
+        'ts': pd.to_datetime(df['DATATIME']),
+        'ghi': pd.to_numeric(df.get('辐照度', df.get('GHI', 0)), errors='coerce').fillna(0),
+        't2m': pd.to_numeric(df.get('气温', df.get('T2m', 20)), errors='coerce').fillna(20),
+        'ws2m': pd.to_numeric(df.get('风速', df.get('WS2m', 3)), errors='coerce').fillna(3),
+    })
+    if start:
+        wx = wx[(wx['ts'].dt.date >= pd.to_datetime(start).date())
+                & (wx['ts'].dt.date <= pd.to_datetime(end).date())].reset_index(drop=True)
+    try:
+        out = compute_physics_power(wx, lat, lon, tilt=tilt, azimuth=az, kwp=kwp)
+    except Exception:
+        out = wx.copy()
+        out['p_phys_kw'] = (wx['ghi'] / 1000.0 * kwp).clip(0, kwp * 1.2)
+    # 注意原函数调用形参名
+    return {
+        'kind': 'dataset_physics',
+        'pv_file': getattr(meta, 'get', lambda k, d=None: d)('display_name', None) or '',
+        'count': int(len(out)),
+        'predicted_kwh': _safe_num(out['p_phys_kw'].sum() if 'p_phys_kw' in out else 0),
+        'curves': [{'ts': str(pd_Timestamp(r['ts']))[:19],
+                    'phys_kw': _safe_num(r['p_phys_kw'])} for _, r in out.iterrows()][:240]
+        if len(out) else [],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) diagnose_risk —— 风险诊断
+# ─────────────────────────────────────────────────────────────────────────────
+def diagnose_risk(params: Dict[str, Any], user: Dict[str, Any],
+                  trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    site_id = params.get('site_id')
+    pv_file = params.get('pv_file')
+    start_date = params.get('start_date')
+    end_date = params.get('end_date')
+
+    risks = []
+    sources: List[str] = []
+
+    try:
+        # 1. 数据质量证据
+        dq = check_data_quality({'pv_file': pv_file, 'site_id': site_id,
+                                 'start_date': start_date, 'end_date': end_date},
+                                user, trace_id)
+        if dq.success and dq.data:
+            d = dq.data
+            sources.append('check_data_quality')
+            if d['missing_rate_pct'].get('POWER', 0) > 5:
+                risks.append({'level': 'high', 'type': 'data_missing',
+                              'desc': f"功率数据缺失 {d['missing_rate_pct']['POWER']}%",
+                              'action': '回填 NASA POWER 气象或补充计采数据'})
+            if d['out_of_range_pct'] > 1:
+                risks.append({'level': 'high', 'type': 'power_out_of_range',
+                              'desc': f"功率越界 {d['out_of_range_pct']}%（>1.2×容量或<0）",
+                              'action': '清洗越界数据并检查逆变器工况'})
+            if d['max_gap_hours'] > 6:
+                risks.append({'level': 'medium', 'type': 'time_gap',
+                              'desc': f"最大时间断档 {d['max_gap_hours']:.0f} 小时",
+                              'action': '核对采样链路，缺口超过 6 小时建议重建时序特征'})
+
+        # 2. 预测结果证据
+        fc = forecast_power({'site_id': site_id, 'pv_file': pv_file,
+                             'start_date': start_date, 'end_date': end_date},
+                            user, trace_id)
+        if fc.success and fc.data:
+            d = fc.data
+            sources.append('forecast_power')
+            if d.get('fallback') == 'physics':
+                risks.append({'level': 'medium', 'type': 'no_ml_model',
+                              'desc': '当前无 ML 残差模型，已回退物理模型，预测精度可能下降',
+                              'action': '为站点训练混合残差模型以提升精度'})
+            if d.get('has_ml') is False and d.get('kind') == 'user_site_hybrid':
+                risks.append({'level': 'info', 'type': 'model_optional',
+                              'desc': '物理模型可用但不含统计修正', 'action': '可选：训练残差模型'})
+            daily = d.get('daily_energy_kwh') or []
+            if daily:
+                low_day = min(daily, key=lambda x: x.get('final_kwh') or 0)
+                risks.append({'level': 'info', 'type': 'low_energy_day',
+                              'desc': f"{low_day['date']} 预测发电最低 "
+                                      f"({_safe_num(low_day.get('final_kwh'))} kWh)",
+                              'action': '关注低辐照日是否需要储能补充或错峰用电'})
+
+        if not risks:
+            risks.append({'level': 'info', 'type': 'no_risk_found',
+                          'desc': '未发现明显风险', 'action': '维持当前运行'})
+
+        return ok({'risks': risks, 'count': len(risks)},
+                  source=sources or ['rules'], trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'风险诊断失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) optimize_storage —— 储能优化与收益
+# ─────────────────────────────────────────────────────────────────────────────
+def optimize_storage(params: Dict[str, Any], user: Dict[str, Any],
+                     trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    pv_file = params.get('pv_file')
+    site_id = params.get('site_id')
+
+    try:
+        # 获取预测功率曲线（统一为 DATATIME/POWER_pred 的 DataFrame）
+        fc = forecast_power({'site_id': site_id, 'pv_file': pv_file,
+                             'forecast_days': params.get('forecast_days', 7),
+                             'start_date': params.get('start_date'),
+                             'end_date': params.get('end_date')},
+                            user, trace_id)
+        if not fc.success:
+            return fc
+        fc_data = fc.data
+
+        # 组装 DataFrame
+        import pandas as pd
+        if fc_data.get('kind') == 'user_site_hybrid':
+            df_pred = pd.DataFrame(fc_data['curves'])
+            df_pred = df_pred.rename(columns={'ts': 'DATATIME', 'final_kw': 'POWER_pred'})
+        elif fc_data.get('kind') == 'dataset_iid':
+            df_pred = pd.DataFrame(fc_data['predictions'])
+            df_pred = df_pred.rename(columns={'ts': 'DATATIME', 'pred_kw': 'POWER_pred'})
+        elif fc_data.get('kind') == 'dataset_physics':
+            df_pred = pd.DataFrame(fc_data['curves'])
+            df_pred = df_pred.rename(columns={'ts': 'DATATIME', 'phys_kw': 'POWER_pred'})
+        else:
+            return fail(EC.E_INTERNAL, '预测返回结构无法用于储能优化',
+                        trace_id=trace_id, elapsed_ms=_ms(t0))
+
+        if df_pred.empty or 'DATATIME' not in df_pred:
+            return fail(EC.E_EMPTY_DATA, '无预测曲线可优化',
+                        trace_id=trace_id, elapsed_ms=_ms(t0))
+
+        import pandas as pd
+        df_pred['DATATIME'] = pd.to_datetime(df_pred['DATATIME'])
+        # 时间步长取数据真实间隔：内置数据集多为逐小时，硬编码 10 分钟会把能量与收益算低 6 倍
+        time_step_minutes = 10
+        if len(df_pred) >= 2:
+            diffs = df_pred['DATATIME'].diff().dropna()
+            if len(diffs):
+                med = diffs.median()
+                if hasattr(med, 'total_seconds'):
+                    time_step_minutes = max(int(med.total_seconds() / 60), 1) or 10
+
+        from backend.api.application import (EnergyStorageOptimizer,
+                                             generate_time_prices,
+                                             get_province_prices)
+        from utils.data_loader import get_geo_finder
+
+        # 省份电价（优先用户显式指定；其次取 pv_file 名前缀，如「云南 - Timeseries_…」；
+        # 再退到 GeoFinder 按经纬度反查）
+        from utils.data_loader import get_geo_finder
+        province = params.get('province')
+        if not province and pv_file:
+            head = (pv_file or '').split(' - ')[0].strip()
+            from utils.data_loader import get_data_files
+            try:
+                for name in get_data_files():
+                    if name.endswith(' - ' + pv_file.split('/')[-1]) or name == pv_file:
+                        head = name.split(' - ')[0].strip()
+                        break
+            except Exception:
+                pass
+            if head and 'Timeseries' not in head and 'csv' not in head:
+                province = head[:8]
+        prices = None
+        site_prices = None
+        if site_id is not None and not pv_file:
+            # 用户电站：站点保存电价优先，其次按经纬度反查省份库
+            from utils import site_store
+            site = site_store.get_site_readable(int(site_id), user['id'])
+            if site:
+                sp = site.get('prices') or {}
+                if any(sp.get(k) is not None for k in ('sharp', 'peak', 'flat', 'valley')):
+                    site_prices = sp
+                if not province:
+                    try:
+                        province = get_geo_finder().get_province(
+                            float(site['lon']), float(site['lat']))
+                    except Exception:
+                        province = None
+        if not province and pv_file:
+            try:
+                from utils.predictor import parse_pv_filename
+                m = parse_pv_filename(pv_file)
+                lat_s, lon_s = m.get('latitude'), m.get('longitude')
+                if lat_s != 'N/A' and 'N' in str(lat_s):
+                    gf = get_geo_finder()
+                    lat = float(str(lat_s).replace('°N', ''))
+                    lon = float(str(lon_s).replace('°E', '').replace('°W', ''))
+                    if str(lon_s).endswith('°W'):
+                        lon = -lon
+                    province = gf.get_province(lon, lat)
+            except Exception:
+                province = None
+        if province:
+            try:
+                prices = get_province_prices(province)
+            except Exception:
+                prices = None
+        if site_prices:
+            prices = {**(prices or {}), **{k: site_prices[k]
+                                            for k in ('sharp', 'peak', 'flat', 'valley')
+                                            if site_prices.get(k) is not None}}
+
+        bc = int(params.get('battery_capacity') or 1000)
+        bp = int(params.get('battery_power') or 500)
+        eff = int(params.get('efficiency') or 90)
+        soc0 = int(params.get('initial_soc') or 50)
+        load_ratio = float(params.get('load_ratio') or 0.3)
+        load_type = params.get('load_type') or 'industrial'
+
+        opt = EnergyStorageOptimizer(capacity=bc, power=bp, initial_soc=soc0,
+                                     efficiency=eff, load_ratio=load_ratio)
+        n = len(df_pred)
+        default_prices = {'sharp': 1.0, 'peak': 0.8, 'flat': 0.6, 'valley': 0.3}
+        if prices:
+            tp = generate_time_prices(n, prices['sharp'], prices['peak'],
+                                      prices['flat'], prices['valley'],
+                                      timestamps=df_pred['DATATIME'])
+        else:
+            tp = generate_time_prices(n, **default_prices,
+                                      timestamps=df_pred['DATATIME'])
+            prices = {**default_prices}
+
+        strat = opt.optimize(df_pred[['DATATIME', 'POWER_pred']], tp,
+                             time_step_minutes=time_step_minutes)
+        # 收益：复用优化器自带 calculate_revenue（物理口径已内建）
+        try:
+            feed_in = (params.get('feed_in_tariff')
+                       or (site_prices or {}).get('feed_in') or 0.4)
+            rev = opt.calculate_revenue(feed_in_tariff=float(feed_in),
+                                        time_step_minutes=time_step_minutes)
+        except Exception:
+            rev = {'net_revenue': 0.0, 'discharge_revenue': 0.0,
+                   'avoid_curtailment': 0.0, 'grid_cost': 0.0}
+        soc = strat['SOC'].to_numpy() if 'SOC' in strat else None
+        detail = []
+        for i in range(min(24, n)):
+            r = strat.iloc[i]
+            detail.append({'time': str(r['DATATIME'])[11:16],
+                           'price': round(float(r['Price']), 3),
+                           'power_kw': round(float(r['Charge_Discharge']), 2),
+                           'soc': round(float(r['SOC']), 1)})
+
+        # 周期按真实时间跨度折算：内置数据集常为「仅白天约 15 行/天」，
+        # 用 行数/24 会把周期算短，日均收益随之偏高
+        span_days = 1.0 / 24
+        if n >= 2:
+            span_days = max(
+                (df_pred['DATATIME'].max() - df_pred['DATATIME'].min()).total_seconds() / 86400,
+                1.0 / 24)
+        n_days = round(span_days, 2)
+        return ok({
+            'battery_kwh': bc,
+            'power_kw': bp,
+            'province': province or '未识别（使用默认电价）',
+            'prices': prices,
+            'has_price_evidence': bool(province) or bool(site_prices),
+            'strategy_head': detail,
+            'soc_tail': [round(float(x), 1) for x in soc[-24:]] if soc is not None else [],
+            'net_revenue_est_yuan_per_day': round(float(rev.get('net_revenue', 0)) / n_days, 2),
+            'net_revenue_est_yuan': round(float(rev.get('net_revenue', 0)), 2),
+            'revenue_breakdown': {'discharge': float(rev.get('discharge_revenue', 0)),
+                                  'avoid_curtailment': float(rev.get('avoid_curtailment', 0)),
+                                  'grid_cost': float(rev.get('grid_cost', 0))},
+            'period_days': n_days,
+            'uncertainty': '收益为估算值：未计储放损耗以外的运维成本与并网约束' if province else
+                           '无省级电价证据，收益按默认电价估算，属演示口径',
+            'time_value_minutes': time_step_minutes,
+        }, source=['application.EnergyStorageOptimizer', 'price_database.json'],
+            trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'储能优化失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) search_knowledge —— 知识库 RAG
+# ─────────────────────────────────────────────────────────────────────────────
+def search_knowledge(params: Dict[str, Any], user: Dict[str, Any],
+                     trace_id: str = "") -> ToolResult:
+    t0 = time.time()
+    query = params.get('query')
+    top = int(params.get('top') or 5)
+    if not query:
+        return fail(EC.E_BAD_PARAM, '缺少 query', trace_id=trace_id, elapsed_ms=_ms(t0))
+    try:
+        # M3.3 混合检索优先（BM25+向量），失败/空结果回退旧关键词检索
+        hits, engine = [], 'knowledge_base'
+        try:
+            from backend.utils.rag_retriever import Retriever
+            hits = Retriever.instance().retrieve(query, max(1, min(top, 8)))
+            if hits:
+                engine = 'rag_hybrid'
+        except Exception:
+            hits = []
+        if not hits:
+            from backend.utils.knowledge_base import search_kb
+            hits = search_kb(query, max(1, min(top, 8)))
+        if not hits:
+            return ok({'hits': [], 'count': 0, 'query': query},
+                      source=['knowledge_base'], trace_id=trace_id, elapsed_ms=_ms(t0))
+        out = []
+        for i, h in enumerate(hits, 1):
+            out.append({
+                'id': h.get('id'), 'title': h.get('title'), 'path': h.get('path'),
+                'score': h.get('score'), 'snippet': h.get('snippet'),
+                'tags': h.get('tags') or [],
+                'citation_id': f"[{i}]",
+                'source': h.get('source') or h.get('path') or '',
+                'date': h.get('date') or '',
+                'region': h.get('region') or [],
+                'authority': h.get('authority') or [],
+                'topic': h.get('topic') or '',
+                'evidence': h.get('evidence') or [],
+                'semantic': h.get('semantic'),
+            })
+        return ok({
+            'query': query,
+            'count': len(out),
+            'hits': out,
+        }, source=[engine], trace_id=trace_id, elapsed_ms=_ms(t0))
+    except Exception as e:
+        return fail(EC.E_UPSTREAM, f'知识库检索失败: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8) generate_report —— 结构化报告
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_report(params: Dict[str, Any], user: Dict[str, Any],
+                    trace_id: str = "", cached: Optional[Dict[str, ToolResult]] = None) -> ToolResult:
+    t0 = time.time()
+    site_id = params.get('site_id')
+    pv_file = params.get('pv_file')
+    forecast_days = int(params.get('forecast_days') or 7)
+    mode = params.get('mode') or 'future'
+    # 透传时间窗口与储能配置：否则报告会回落到默认 7 天窗口和 1000kWh/500kW
+    window = {k: params[k] for k in ('start_date', 'end_date') if params.get(k)}
+    storage = {k: params[k] for k in
+               ('battery_capacity', 'battery_power', 'efficiency', 'initial_soc',
+                'load_ratio', 'load_type', 'province')
+               if params.get(k) is not None}
+
+    cached = cached or {}
+
+    def _run(name, p):
+        """优先用状态机已缓存的结果，未缓存才真实执行（避免重复耗时）。"""
+        if name in cached:
+            return cached[name]
+        return agent_tools_run(name, p, user, trace_id=trace_id)
+
+    from .tools import run_tool as agent_tools_run
+
+    # 聚合各工具结果（真实调用，失败项标注降级/未验证）
+    site = _run('get_site',
+                {'site_id': site_id} if site_id else {'pv_file': pv_file})
+    site = site.to_dict() if isinstance(site, ToolResult) else site
+    dq = _run('check_data_quality',
+              {'pv_file': pv_file, 'site_id': site_id, **window})
+    dq = dq.to_dict() if isinstance(dq, ToolResult) else dq
+    fc = _run('forecast_power', {'site_id': site_id, 'pv_file': pv_file,
+                                 'forecast_days': forecast_days, 'mode': mode,
+                                 **window})
+    fc = fc.to_dict() if isinstance(fc, ToolResult) else fc
+    risk = _run('diagnose_risk',
+                {'site_id': site_id, 'pv_file': pv_file, **window})
+    risk = risk.to_dict() if isinstance(risk, ToolResult) else risk
+    opt = _run('optimize_storage', {'site_id': site_id, 'pv_file': pv_file,
+                                    'forecast_days': forecast_days,
+                                    **window, **storage})
+    opt = opt.to_dict() if isinstance(opt, ToolResult) else opt
+    kb = _run('search_knowledge', {'query': '光伏 储能 收益 电价 政策'})
+    kb = kb.to_dict() if isinstance(kb, ToolResult) else kb
+
+    def _fmt(v, nd=2):
+        """千位分隔数值；非数值原样返回。"""
+        try:
+            return f"{float(v):,.{nd}f}"
+        except (TypeError, ValueError):
+            return str(v) if v is not None else '-'
+
+    # 展示口径：给了时间窗口按窗口写，否则按 forecast_days（避免表头写 7 天、正文跑 2 天）
+    if window.get('start_date') and window.get('end_date'):
+        scope = f"{window['start_date']} ~ {window['end_date']}"
+    else:
+        scope = f"未来 {forecast_days} 天"
+
+    lines = []
+    lines.append('# 光伏发电分析与协同优化报告')
+    lines.append('')
+    # 关键标识置顶（引用块）
+    lines.append(f'> **trace_id**: `{trace_id}`')
+    lines.append(f'> **日期**: {time.strftime("%Y-%m-%d %H:%M")}')
+    lines.append(f'> **模式**: {mode}（{scope}）')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 一、执行摘要（关键指标表，居中对齐） ─────────────────────────────
+    lines.append('## 一、执行摘要')
+    lines.append('')
+    site_name = '-'
+    kwp = None
+    coord = None
+    site_note = ''
+    if site.get('success') and site.get('data'):
+        sd = site['data']
+        site_name = sd.get('name') or sd.get('display_name') or sd.get('pv_file') or '-'
+        kwp = sd.get('kwp') or (sd.get('provider') or {}).get('kwp')
+        prov = sd.get('provider') or {}
+        if prov.get('latitude'):
+            coord = f"{prov.get('latitude')}, {prov.get('longitude')}"
+        elif sd.get('lat') is not None:
+            coord = f"{sd.get('lat')}, {sd.get('lon')}"
+    else:
+        site_note = str(site.get('message') or '')
+
+    quality = '-'
+    if dq.get('success') and dq.get('data'):
+        quality = str(dq['data'].get('quality_level') or '-')
+    e_final = (fc.get('data') or {}).get('total_energy_final_kwh')
+    e_phys = (fc.get('data') or {}).get('total_energy_phys_kwh')
+    day_rev = (opt.get('data') or {}).get('net_revenue_est_yuan_per_day')
+    risk_levels = [(r.get('level') or 'low') for r in ((risk.get('data') or {}).get('risks') or [])]
+    worst = 'high' if 'high' in risk_levels else ('medium' if 'medium' in risk_levels else
+                                                 ('low' if risk_levels else '-'))
+
+    lines.append('| 指标 | 数值 | 说明 |')
+    lines.append('|:---:|:---:|:---|')
+    lines.append(f'| 站点 | {site_name} | {site_note or "数据集/用户站点"} |')
+    if coord:
+        lines.append(f'| 坐标 | {coord} | 经纬度 |')
+    if kwp is not None:
+        lines.append(f'| 装机容量 | {_fmt(kwp, 2)} kWp | 额定容量 |')
+    lines.append(f'| 数据质量 | **{quality}** | 数据完整性评级 |')
+    if e_final is not None:
+        lines.append(f'| 预测总发电量 | **{_fmt(e_final)} kWh** | {scope} 合计 |')
+    if e_phys is not None:
+        lines.append(f'| 物理基准发电量 | {_fmt(e_phys)} kWh | 无 ML 残差口径 |')
+    if day_rev is not None:
+        lines.append(f'| 估算日净收益 | **{_fmt(day_rev)} 元/天** | 储能优化口径 |')
+    lines.append(f'| 最高风险等级 | **{worst}** | 共 {len(risk_levels)} 项风险 |')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 二、关键数据 ─────────────────────────────────────────────────────
+    lines.append('## 二、关键数据')
+    lines.append('')
+    lines.append('### 2.1 数据质量')
+    lines.append('')
+    if dq.get('success') and dq.get('data'):
+        dd = dq['data']
+        mp = dd.get('missing_rate_pct') or {}
+        missing_str = ', '.join(f'{k} {v}%' for k, v in mp.items()) or '-'
+        lines.append('| 项目 | 数值 |')
+        lines.append('|:---|:---|')
+        lines.append(f"| 数据范围 | {dd.get('start')} ~ {dd.get('end')} |")
+        lines.append(f"| 记录数 | {_fmt(dd.get('total_records'), 0)} 条 |")
+        lines.append(f"| 采样间隔 | {dd.get('interval_hours')} h |")
+        lines.append(f"| 最大断档 | {dd.get('max_gap_hours')} h |")
+        lines.append(f"| 缺失率 | {missing_str} |")
+        lines.append(f"| 越界率 | {dd.get('out_of_range_pct')}% |")
+        lines.append(f"| 质量评级 | **{dd.get('quality_level')}** |")
+        lines.append('')
+        suggestions = dd.get('suggestions') or []
+        if suggestions:
+            lines.append('> 💡 **处理建议**')
+            lines.append('>')
+            for s in suggestions:
+                lines.append(f'> - {s}')
+            lines.append('')
+    else:
+        lines.append(f"> ⚠️ 数据质量检查未完成：{dq.get('message')}")
+        lines.append('')
+    lines.append('### 2.2 发电量预测')
+    lines.append('')
+    if fc.get('success') and fc.get('data'):
+        fd = fc['data']
+        kind_label = fd.get('kind') or '-'
+        lines.append(f"- 预测方式: {kind_label}" + ('（ML+物理混合）' if fd.get('has_ml') else ''))
+        if fd.get('count'):
+            lines.append(f"- 预测点数: {_fmt(fd['count'], 0)}")
+        lines.append('')
+        lines.append('预测区间电量按采样点功率积分：')
+        lines.append('')
+        lines.append('$$E = \\sum_{i=1}^{N} P_i \\cdot \\Delta t$$')
+        lines.append('')
+        dt = (dq.get('data') or {}).get('interval_hours') or 0.5
+        est = None
+        if fd.get('kind') == 'dataset_iid':
+            preds = fd.get('predictions') or []
+            if preds:
+                est = sum(p.get('pred_kw') or 0 for p in preds) * float(dt)
+        lines.append('| 变量 | 含义 | 取值/单位 |')
+        lines.append('|:---|:---|:---|')
+        lines.append('| $P_i$ | 第 $i$ 个采样点预测功率 | kW |')
+        lines.append(f'| $\\Delta t$ | 采样间隔 | {dt} h |')
+        lines.append(f"| $N$ | 预测点数 | {_fmt(fd.get('count') or 0, 0)} |")
+        if est is not None:
+            lines.append(f'| $E$ | 预测区间积分电量 | **{_fmt(est)} kWh** |')
+        if e_final is not None:
+            lines.append(f'| $E_{{final}}$ | 模型输出总发电量 | **{_fmt(e_final)} kWh** |')
+        lines.append('')
+    else:
+        lines.append(f"> ⚠️ 功率预测未完成：{fc.get('message')}")
+        lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 三、风险与建议（风险表，等级居中） ───────────────────────────────
+    lines.append('## 三、风险与建议')
+    lines.append('')
+    if risk.get('success') and risk.get('data') and risk['data'].get('risks'):
+        lines.append('| 等级 | 风险描述 | 处置建议 |')
+        lines.append('|:---:|:---|:---|')
+        for r in risk['data']['risks']:
+            lvl = r.get('level') or 'low'
+            lines.append(f"| **{lvl}** | {r.get('desc', '')} | {r.get('action', '')} |")
+        lines.append('')
+        if 'high' in risk_levels:
+            lines.append('> ⚠️ **风险提示**: 存在 **high** 级风险，任务已进入人工确认门，确认后才会继续执行。')
+            lines.append('')
+    else:
+        lines.append(f"> ⚠️ 风险诊断未完成：{risk.get('message')}")
+        lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 四、储能与收益（公式 + 变量释义表） ─────────────────────────────
+    lines.append('## 四、储能与收益')
+    lines.append('')
+    if opt.get('success') and opt.get('data'):
+        od = opt['data']
+        rb = od.get('revenue_breakdown') or {}
+        lines.append('| 项目 | 数值 | 说明 |')
+        lines.append('|:---|:---:|:---|')
+        lines.append(f"| 储能容量 | {_fmt(od.get('battery_kwh'), 0)} kWh | 配置参数 |")
+        lines.append(f"| 储能功率 | {_fmt(od.get('power_kw'), 0)} kW | 配置参数 |")
+        lines.append(f"| 电价依据 | {od.get('province')} | "
+                     f"{'有省级证据' if od.get('has_price_evidence') else '默认电价，无省级直接证据'} |")
+        lines.append(f"| 估算日净收益 | **{_fmt(od.get('net_revenue_est_yuan_per_day'))} 元/天** | 估算值 |")
+        lines.append(f"| {od.get('period_days')} 天合计 | **{_fmt(od.get('net_revenue_est_yuan'))} 元** | 估算值 |")
+        lines.append('')
+        if rb:
+            lines.append('净收益构成：')
+            lines.append('')
+            lines.append('$$R_{net} = R_{dis} + R_{cur} - C_{grid}$$')
+            lines.append('')
+            lines.append('| 变量 | 含义 | 数值 |')
+            lines.append('|:---|:---|:---:|')
+            lines.append(f"| $R_{{dis}}$ | 放电收益 | {_fmt(rb.get('discharge'))} 元 |")
+            lines.append(f"| $R_{{cur}}$ | 避免弃光收益 | {_fmt(rb.get('avoid_curtailment'))} 元 |")
+            lines.append(f"| $C_{{grid}}$ | 购电成本 | {_fmt(rb.get('grid_cost'))} 元 |")
+            lines.append(f"| $R_{{net}}$ | 净收益（周期合计） | **{_fmt(od.get('net_revenue_est_yuan'))} 元** |")
+            lines.append('')
+    else:
+        lines.append(f"> ⚠️ 储能优化未完成：{opt.get('message')}")
+        lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 五、知识库引用（每篇独立小节，来源置顶） ─────────────────────────
+    lines.append('## 五、知识库引用（RAG）')
+    lines.append('')
+    if kb.get('success') and kb.get('data') and kb['data'].get('hits'):
+        for i, h in enumerate(kb['data']['hits'][:5], 1):
+            title = h.get('title') or '未命名文档'
+            path = h.get('path') or h.get('source') or ''
+            auth = h.get('authority') or []
+            lines.append(f'### 5.{i} 《{title}》')
+            lines.append('')
+            lines.append(f'- **来源**: {path or "-"}')
+            if auth:
+                lines.append(f"- **来源机构**: {', '.join(str(a) for a in auth)}")
+            if h.get('citation_id'):
+                lines.append(f"- **索引标记**: `{'[[' + str(title) + ']]'}` {h['citation_id']}")
+            lines.append('')
+            lines.append((h.get('snippet') or '').strip()[:200])
+            lines.append('')
+    else:
+        lines.append('- 知识库无直接命中或检索失败')
+        lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 六、不确定性说明（📌 备注块） ────────────────────────────────────
+    lines.append('## 六、不确定性说明')
+    lines.append('')
+    warns = []
+    if fc.get('data') and fc['data'].get('fallback') == 'physics':
+        warns.append('预测为物理模型（无 ML 残差），精度低于已训练模型')
+    if fc.get('data') and fc['data'].get('weather_source') == 'nasa_power':
+        warns.append('天气可能来自缓存，时效存在滞后')
+    if not (opt.get('data') or {}).get('has_price_evidence'):
+        warns.append('收益按默认电价估算，未获省级分时电价直接证据')
+    if not warns:
+        warns.append('本次运行未发现明显不确定性来源（部分降级项见对应章节）')
+    lines.append('> 📌 **重要备注**')
+    lines.append('>')
+    for w in warns:
+        lines.append(f'> - {w}')
+    lines.append('')
+    lines.append('---')
+    lines.append('')
+
+    # ── 七、下一步（💡 建议块） ──────────────────────────────────────────
+    lines.append('## 七、下一步')
+    lines.append('')
+    lines.append('> 💡 **处理建议**')
+    lines.append('>')
+    lines.append('> - 如需精度提升：为电站训练混合残差模型（L 训练入口）。')
+    lines.append('> - 如需储能决策：补充实际负荷曲线与并网约束后重跑收益估算。')
+    lines.append('> - 报告中每个数字均有 trace_id 可回溯工具执行链（见文首）。')
+    lines.append('')
+
+    md = '\n'.join(lines)
+    return ok({
+        'markdown': md,
+        'trace_id': trace_id,
+        'site_name': site_name,
+        'model_version': {'forecast': (fc.get('source') or [])[-1] if fc.get('source') else None,
+                          'storage': 'EnergyStorageOptimizer',
+                          'knowledge': 'Knowledge/vault'},
+    }, source=['generate_report'], trace_id=trace_id, elapsed_ms=_ms(t0))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具注册表：name -> (fn, timeout_s)
+# ─────────────────────────────────────────────────────────────────────────────
+from .contracts import TOOL_TIMEOUTS
+
+TOOL_FUNCS = {
+    'get_site': get_site,
+    'check_data_quality': check_data_quality,
+    'get_weather': get_weather,
+    'forecast_power': forecast_power,
+    'diagnose_risk': diagnose_risk,
+    'optimize_storage': optimize_storage,
+    'search_knowledge': search_knowledge,
+    'generate_report': generate_report,
+}
+
+
+def run_tool(name: str, params: Dict[str, Any], user: Dict[str, Any],
+             trace_id: str = "") -> ToolResult:
+    """按名称执行工具（同步）。"""
+    fn = TOOL_FUNCS.get(name)
+    if not fn:
+        return fail(EC.E_BAD_PARAM, f'未知工具: {name}',
+                    trace_id=trace_id, elapsed_ms=0)
+    try:
+        return fn(params, user, trace_id)
+    except Exception as e:
+        traceback.print_exc()
+        return fail(EC.E_INTERNAL, f'{name} 执行异常: {str(e)}',
+                    trace_id=trace_id, elapsed_ms=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────────────────────────────────────
+def _ms(t0) -> int:
+    return int((time.time() - t0) * 1000)
+
+
+def _safe_num(v, default: float = 0.0) -> float:
+    try:
+        f = float(v)
+        if f != f or abs(f) == float('inf'):
+            return default
+        return round(f, 4)
+    except (TypeError, ValueError):
+        return default
+
+
+def pd_Timestamp(v):
+    import pandas as pd
+    try:
+        return pd.Timestamp(v)
+    except Exception:
+        return str(v)
+
+
+def _safe_weather(fetch_fn, *args, **kwargs):
+    """天气获取封装：失败返回 (None, error)；成功返回 (df, meta)。"""
+    try:
+        df, meta = fetch_fn(*args, **kwargs)
+        return df, meta
+    except Exception as e:
+        return None, str(e)

@@ -1,0 +1,181 @@
+"""DuMate Streamable HTTP MCP adapter.
+
+This module exposes the existing eight agent tools through a stateless MCP
+endpoint at ``/mcp``. DuMate must send ``Authorization: Bearer <token>`` on
+every request; tool code still derives the user from that JWT.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, Iterable
+
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, Response
+
+from backend.agent.contracts import TOOL_SCHEMAS, new_trace_id
+from backend.agent.tools import TOOL_FUNCS, resolve_user, run_tool
+
+SERVER_NAME = "pv-station-analysis"
+SERVER_VERSION = "1.1.1"
+DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOL_VERSIONS = {
+    "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25",
+}
+
+mcp_router = APIRouter(tags=["MCP"])
+
+
+def _jsonrpc_result(request_id: Any, result: Dict[str, Any], *, status: int = 200) -> JSONResponse:
+    return JSONResponse(
+        jsonable_encoder({"jsonrpc": "2.0", "id": request_id, "result": result}),
+        status_code=status,
+        headers={"MCP-Protocol-Version": DEFAULT_PROTOCOL_VERSION},
+    )
+
+
+def _jsonrpc_error(request_id: Any, code: int, message: str, *, status: int = 200,
+                   data: Any | None = None) -> JSONResponse:
+    error: Dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return JSONResponse(
+        {"jsonrpc": "2.0", "id": request_id, "error": error},
+        status_code=status,
+        headers={"MCP-Protocol-Version": DEFAULT_PROTOCOL_VERSION},
+    )
+
+
+def _tool_descriptors() -> Iterable[Dict[str, Any]]:
+    """Translate the project's canonical contracts into MCP descriptors."""
+    for name in TOOL_FUNCS:
+        schema = TOOL_SCHEMAS[name]
+        yield {
+            "name": name,
+            "title": schema["summary"],
+            "description": f'{schema["summary"]}；单位：{schema.get("units", "无")}',
+            "inputSchema": schema["params"],
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": name != "generate_report",
+                "openWorldHint": name == "get_weather",
+            },
+        }
+
+
+def _authenticated_user(request: Request):
+    return resolve_user(None, request.headers.get("Authorization"))
+
+
+@mcp_router.get("/mcp")
+async def mcp_get():
+    """Streamable HTTP GET —— 无状态服务器按规范返回 405。
+
+    本服务不推送 server->client 通知，所有 JSON-RPC 均走 POST；
+    MCP Streamable HTTP 规范允许不支持 SSE 的服务器对 GET 返回 405。
+
+    不能改成挂起的 SSE 流：网关做地址安全校验时会发 GET，若返回 200 +
+    永不结束的流，探测方永远等不到响应结束，会被判为「地址安全校验失败」
+    （千帆 330004/330005），导致所有工具调用在到达本服务前就被拦截。
+    """
+    return _jsonrpc_error(
+        None, -32000,
+        "This MCP server uses stateless Streamable HTTP; send JSON-RPC with POST.",
+        status=405,
+    )
+
+
+@mcp_router.delete("/mcp")
+async def mcp_delete():
+    return Response(status_code=204)
+
+
+@mcp_router.post("/mcp")
+async def mcp_post(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _jsonrpc_error(None, -32700, "Parse error", status=400)
+    if not isinstance(body, dict):
+        return _jsonrpc_error(None, -32600, "Invalid Request", status=400)
+
+    request_id = body.get("id")
+    method = body.get("method")
+    params = body.get("params") or {}
+    if body.get("jsonrpc") != "2.0" or not isinstance(method, str):
+        return _jsonrpc_error(request_id, -32600, "Invalid Request", status=400)
+
+    user = _authenticated_user(request)
+    if user is None:
+        return _jsonrpc_error(
+            request_id, -32001,
+            "Unauthorized: valid Bearer token required", status=401,
+        )
+
+    if method == "initialize":
+        requested = params.get("protocolVersion")
+        protocol_version = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else DEFAULT_PROTOCOL_VERSION
+        return _jsonrpc_result(request_id, {
+            "protocolVersion": protocol_version,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": (
+                "光储智联提供站点识别、数据质检、天气、功率预测、风险诊断、"
+                "储能优化、知识检索和报告生成八个工具。预测与收益均为估算，"
+                "不得用于直接设备控制。"
+            ),
+        })
+
+    if method in {"notifications/initialized", "notifications/cancelled"}:
+        return Response(status_code=202)
+    if method == "ping":
+        return _jsonrpc_result(request_id, {})
+    if method == "tools/list":
+        return _jsonrpc_result(request_id, {"tools": list(_tool_descriptors())})
+    if method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+            return _jsonrpc_error(request_id, -32602, "Invalid tools/call params")
+        if tool_name not in TOOL_FUNCS:
+            return _jsonrpc_error(request_id, -32602, f"Unknown tool: {tool_name}")
+        trace_id = request.headers.get("X-Trace-Id") or new_trace_id()
+        result = run_tool(tool_name, arguments, user, trace_id=trace_id)
+        # Weather rows contain pandas.Timestamp values.  Normalize every tool
+        # payload before building both the MCP text block and structuredContent;
+        # otherwise JSON serialization raises and DuMate sees an HTTP 500 even
+        # though the underlying tool completed successfully.
+        payload = jsonable_encoder(result.to_dict())
+        return _jsonrpc_result(request_id, {
+            "content": [{
+                "type": "text",
+                "text": json.dumps(payload, ensure_ascii=False, indent=2),
+            }],
+            "structuredContent": payload,
+            "isError": not result.success,
+        })
+    return _jsonrpc_error(request_id, -32601, f"Method not found: {method}")
+
+
+@mcp_router.get("/api/mcp/health")
+async def mcp_health():
+    return {
+        "status": "healthy",
+        "version": SERVER_VERSION,
+        "transport": "streamable-http",
+        "endpoint": "/mcp",
+        "stateless": True,
+        "tools": list(TOOL_FUNCS),
+    }
+
+
+# Standalone mode is useful for protocol debugging. Production mounts the same
+# router in backend.main so REST, frontend and MCP share one HTTPS host.
+app = FastAPI(title="光储智联 MCP Adapter", version=SERVER_VERSION)
+app.include_router(mcp_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

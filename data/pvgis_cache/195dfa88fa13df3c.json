@@ -1,0 +1,16 @@
+{
+  "source": "PVGIS (pvlib)",
+  "latitude": 27.137,
+  "longitude": 115.052,
+  "year_start": 2019,
+  "year_end": 2019,
+  "surface_tilt": 35.0,
+  "surface_azimuth": 0.0,
+  "peakpower_kwp": 1.0,
+  "loss_percent": 14.0,
+  "timezone": "Asia/Shanghai",
+  "note": "GLOBAL_HORIZONTAL_IRRADIANCE 字段为组件斜面总辐照度(直射+天空散射+地面反射)",
+  "min_date": "2019-01-01 08:30:00",
+  "max_date": "2020-01-01 07:30:00",
+  "rows_total": 8760
+}
